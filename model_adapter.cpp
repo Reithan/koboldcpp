@@ -189,7 +189,7 @@ void print_tok_vec(std::vector<float> &embd)
                 //it could be a newer model, or an old f16/f32 model
                 fin.read((char *)&temp2, sizeof(temp2)); //if previous was par_res, this is ftype. else unknown
 
-                //if it is new ftype, then it must have these properties: > 1000, low multiple of 1k and small remaineder
+                //if it is new ftype, then it must have these properties: > 1000, low multiple of 1k and small remainder
                 bool isNewFtype = (temp2>=1000 && temp2<=9000 && temp2%1000<20);
 
                 if(!isNewFtype)
