@@ -178,6 +178,11 @@ class load_model_inputs(ctypes.Structure):
                 ("quiet", ctypes.c_bool),
                 ("debugmode", ctypes.c_int)]
 
+class igrex_replacer(ctypes.Structure):
+    _fields_ = [("pattern", ctypes.c_char),
+                ("replacement", ctypes.c_char),
+                ("one_shot", ctypes.c_bool)]
+
 class generation_inputs(ctypes.Structure):
     _fields_ = [("seed", ctypes.c_int),
                 ("prompt", ctypes.c_char_p),
@@ -223,7 +228,9 @@ class generation_inputs(ctypes.Structure):
                 ("logit_biases_len", ctypes.c_int),
                 ("logit_biases", ctypes.POINTER(logit_bias)),
                 ("banned_tokens_len", ctypes.c_int),
-                ("banned_tokens", ctypes.POINTER(ctypes.c_char_p))]
+                ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
+                ("igrex_replacers_len", ctypes.c_int),
+                ("igrex_replacers", ctypes.POINTER(igrex_replacer))]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -1147,6 +1154,7 @@ def generate(genparams, stream_flag=False):
     banned_tokens = genparams.get('banned_tokens', banned_strings)
     bypass_eos_token = genparams.get('bypass_eos', False)
     custom_token_bans = genparams.get('custom_token_bans', '')
+    igrex_replacers = genparams.get('igrex_replacers', [])
 
     for tok in custom_token_bans.split(','):
         tok = tok.strip()  # Remove leading/trailing whitespace
@@ -1225,6 +1233,23 @@ def generate(genparams, stream_flag=False):
 
     for n, breaker in enumerate(dry_sequence_breakers):
         inputs.dry_sequence_breakers[n] = breaker.encode("UTF-8")
+    
+    # Hand igrex replacers being passed as json-encoded array or tuples
+    # [["pattern", "replacement", is_one_shot?], ...]
+    # TODO
+    if isinstance(igrex_replacers, str):
+        try:
+            igrex_replacers = json.loads(igrex_replacers)
+        except ValueError as e:
+            print(f"ERROR: igrex_replacers must be an array of strings or a json encoded array of strings. Could not parse '{igrex_replacers}': " + str(e))
+            igrex_replacers = []
+
+    igrex_replacers = igrex_replacers[:4] # igrex_replacers_max] # TODO set max (4-6?)
+    inputs.igrex_replacers_len = len(igrex_replacers)
+    inputs.igrex_replacers = (ctypes.c_char_p * inputs.igrex_replacers_len)()
+
+    for n, replacer in enumerate(igrex_replacers):
+        inputs.igrex_replacers[n] = replacer.encode("UTF-8")
 
     if sampler_order and 0 < len(sampler_order) <= sampler_order_max:
         try:
