@@ -20,6 +20,7 @@
 #include <string>
 #include <cctype>
 #include <locale>
+#include <regex>
 
 #include "utils.h"
 
@@ -47,6 +48,7 @@
 const int extra_context_handle_fragmentation = 120;
 const int LLAVA_TOKEN_IDENTIFIER_A = -998; //alternate between both, changing when image changes
 const int LLAVA_TOKEN_IDENTIFIER_B = -999;
+const float IGREX_MAX_COMPLEXITY = 200.0f;
 
 //shared
 std::string executable_path = "";
@@ -122,6 +124,7 @@ static std::vector<std::string> banned_phrases;
 static std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>> dry_sequence_breakers; // Multi-mapping from first token of sequence to tail of sequence (tail is empty for a single token)
 static std::vector<int> dry_repeat_count; // Indexed as last_n_tokens
 static std::unordered_map<gpt_vocab::id, int> dry_max_token_repeat;
+static std::vector<igrex_replacer> igrex_replacers;
 static std::vector<TopPicksData> top_picks_history;
 static int remaining_tokens = 0;
 static bool early_abort = false;
@@ -1173,6 +1176,28 @@ void sample_dry(int n_ctx, int penalty_range, float penalty_multiplier, float pe
     }
 }
 
+void sample_igrex(int n_ctx, std::unordered_map<int, float>& removal_penalties, llama_token_data_array * candidates) {
+    if(candidates->sorted) {
+        if (debugmode==1 && !is_quiet) {
+            printf("sample_igrex can't run on sorted candidates!");
+        }
+        return;
+    }
+
+    if (removal_penalties.size() == 0)
+        return;
+
+    // penalize token candidates based on recency of regex removed tokens
+    for (size_t i = 0; i < candidates->size; ++i) {
+        llama_token token_id = candidates->data[i].id;
+        if (auto found = removal_penalties.find(token_id); removal_penalties.end() != found) {
+            candidates->data[i].logit *= (1.0f - found->second);
+        }
+    }
+    
+    return;
+}
+
 void sample_rep_pen(int n_ctx, int rep_pen_range, float rep_pen, float rep_pen_slope, float presence_penalty, llama_token_data_array * candidates_p)
 {
     auto last_n_repeat = std::min(std::min((int)last_n_tokens.size(), rep_pen_range), n_ctx);
@@ -1586,6 +1611,8 @@ const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dyna
 
     //dry always first as logits cannot be resorted
     sample_dry(n_ctx, dry_penalty_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_sequence_breakers, &candidates_p);
+    // sample igrex after dry as it, too, needs unsorted tokens
+    sample_igrex(n_ctx, std::unordered_map<llama_token, float>()/* TODO: hook up penalty map here */, &candidates_p);
 
     //prefilter to top 3k tokens for improved speed
     sample_top_k(&candidates_p, 3000);
@@ -2809,6 +2836,40 @@ static void PrepareLlavaEmbds(const int nctx, const std::vector<int> & llava_sep
     }
 }
 
+float igregx_check_complexity(const std::string& candidate, const std::regex_constants::syntax_option_type flags) {
+    // 1. 'or' operators: [^\\]\|
+    static const auto or_match = std::regex("[^\\\\]\\|");
+    // 2. Look-arounds: (^|[^\\])\(\?[!=<]
+    static const auto lookaround_match = std::regex("(^|[^\\\\])\\(\\?[!=<]");
+    // 3. Greedy searches: (^|[^\\])[*+]([^?]|$)
+    static const auto greedy_match = std::regex("(^|[^\\\\])[*+]([^?]|$)");
+    // 4. Complex classes: (^|[^\\])\[(\^.{4,}|.{6,}|.*?[^\\]-.+?)\]
+    static const auto class_match = std::regex("(^|[^\\\\])\\[(\\^.{4,}|.{6,}|.*?[^\\\\]-.+?)\\]");
+    // 5. Backref: (^|[^\\])\\\d
+    static const auto backref_match = std::regex("(^|[^\\\\])\\\\\\d");
+
+    float complexity_score = candidate.length();
+    complexity_score *= ((flags & std::regex_constants::icase) != 0 ? 1.0f : 1.05f);
+
+    auto count_matches = [](const std::string& str, const std::regex& regex) {
+        return std::distance(std::sregex_iterator(str.begin(), str.end(), regex), std::sregex_iterator());
+    };
+
+    int or_count = count_matches(candidate, or_match);
+    int lookaround_count = count_matches(candidate, lookaround_match);
+    int greedy_count = count_matches(candidate, greedy_match);
+    int class_count = count_matches(candidate, class_match);
+    int backref_count = count_matches(candidate, backref_match);
+
+    complexity_score *= pow(1.0f + or_count * 0.25f, or_count);
+    complexity_score *= pow(1.0f + lookaround_count * 0.5f, lookaround_count);
+    complexity_score *= (1.0f + greedy_count * 0.3f);
+    complexity_score *= (1.0f + class_count * 0.5f);
+    complexity_score *= (1.0f + backref_count * 0.5f);
+
+    return complexity_score;
+}
+
 generation_outputs gpttype_generate(const generation_inputs inputs)
 {
     generation_outputs output;
@@ -3010,6 +3071,41 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     kcpp_data->dynatemp_exponent = inputs.dynatemp_exponent;
     kcpp_data->n_ctx = inputs.max_context_length;
     kcpp_data->smoothing_factor = inputs.smoothing_factor;
+    
+    // parse igrex replacers
+    kcpp_data->igrex_replacers.clear();
+    igrex_replacers.clear();
+    const auto flags_regx = std::regex("^/?(.+)/([gimsuy]*)");
+    for (size_t i = 0; i < inputs.igrex_replacers_len; ++i)
+    {
+        std::cmatch imatch;
+        if(!std::regex_match(inputs.igrex_replacers[i]->pattern, imatch, flags_regx)) {
+            printf("\nInvalid regex string passed to igrex: %s", inputs.igrex_replacers[i]->pattern);
+            continue;
+        }
+        std::string spattern = imatch[1];
+        std::string flags = imatch[2];
+        if (flags != "" && flags != "i") {
+            printf("\nInvalid regex flags passed to igrex (only 'i' supported): %s", inputs.igrex_replacers[i]->pattern);
+            continue;
+        }
+        std::regex_constants::syntax_option_type option = std::regex_constants::ECMAScript | std::regex_constants::optimize;
+        if (flags.length() != 0)
+            option |= std::regex_constants::icase;
+
+        if (igregx_check_complexity(spattern, option) > IGREX_MAX_COMPLEXITY) {
+            printf("\nRegex passed to igrex exceeds max complexity limit: %s", inputs.igrex_replacers[i]->pattern);
+            continue;
+        }
+
+        kcpp_params::igrex_replacer igrex_replacer = {
+            std::regex(spattern, option),
+            std::string(inputs.igrex_replacers[i]->replacement),
+            inputs.igrex_replacers[i]->is_one_shot,
+        };
+        kcpp_data->igrex_replacers.push_back(igrex_replacer);
+    }
+    
 
     // Parse dry sequence breakers / restart sequences
     kcpp_data->dry_sequence_breakers.clear();
