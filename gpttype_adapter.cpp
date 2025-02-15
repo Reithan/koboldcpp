@@ -124,7 +124,7 @@ static std::vector<std::string> banned_phrases;
 static std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>> dry_sequence_breakers; // Multi-mapping from first token of sequence to tail of sequence (tail is empty for a single token)
 static std::vector<int> dry_repeat_count; // Indexed as last_n_tokens
 static std::unordered_map<gpt_vocab::id, int> dry_max_token_repeat;
-static std::vector<igrex_replacer> igrex_replacers;
+static std::vector<kcpp_params::igrex_replacer> igrex_replacers;
 static std::vector<TopPicksData> top_picks_history;
 static int remaining_tokens = 0;
 static bool early_abort = false;
