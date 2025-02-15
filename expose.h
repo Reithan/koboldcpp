@@ -67,8 +67,16 @@ struct load_model_inputs
     const bool quiet = false;
     const int debugmode = 0;
 };
+
 struct generation_inputs
 {
+    struct igrex_replacer
+    {
+        const char * pattern = nullptr;
+        const char * replacement = nullptr;
+        const bool is_one_shot = false;
+    };
+
     const int seed = 0;
     const char * prompt = nullptr;
     const char * memory = nullptr;
@@ -114,6 +122,8 @@ struct generation_inputs
     const logit_bias * logit_biases = nullptr;
     const int banned_tokens_len = 0;
     const char ** banned_tokens = nullptr;
+    const int igrex_replacers_len = 0;
+    const igrex_replacer ** igrex_replacers = nullptr;
 };
 struct generation_outputs
 {

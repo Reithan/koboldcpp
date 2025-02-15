@@ -10,12 +10,19 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <regex>
 
 #include "utils.h"
 #include "model_adapter.h"
 
 //for sampler params
 struct kcpp_params {
+    struct igrex_replacer {
+        std::regex pattern = std::regex("");
+        std::string replacement = "";
+        bool is_one_shot = false;
+    };
+
     uint32_t seed                 = 0xFFFFFFFF; // RNG seed
     int32_t n_predict             =    -1; // new tokens to predict
     int32_t n_ctx                 =     0; // context size
@@ -44,6 +51,7 @@ struct kcpp_params {
     int32_t dry_allowed_length = 2;    // repeated sequences longer than this are penalized
     int32_t dry_penalty_last_n = 0;    // how many tokens to scan for repetitions (0 = entire context)
     std::vector<std::string> dry_sequence_breakers; // DRY sequence breakers
+    std::vector<igrex_replacer> igrex_replacers;
     float xtc_threshold        = 0;
     float xtc_probability      = 0;
     float   dynatemp_range     = 0.0f;  // enables DynaTemp if greater than 0. dynatemp_min = temperature - dt_range, dynatemp_max = temperature + dt_range
