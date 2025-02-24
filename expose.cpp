@@ -10,7 +10,7 @@
 #include <cassert>
 #include <cstring>
 #include <fstream>
-#include <regex>
+//#include <regex> TODO: Is this used??
 #include <iostream>
 #include <iterator>
 #include <queue>
