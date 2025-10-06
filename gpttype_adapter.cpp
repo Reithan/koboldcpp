@@ -1636,6 +1636,181 @@ void sample_guidance(struct llama_context * ctx, struct llama_context * guidance
     }
 }
 
+// Fractional sampling: separates tokens like distillation fractions
+// Heads (deterministic) > Feints (cliches) > Hearts (creative) > Tails (gibberish)
+void sample_fractional(
+    llama_token_data_array * candidates,
+    float heads_cutoff = 15.0f,      // Absolute logit for deterministic tokens
+    float tails_cutoff = 6.0f,       // Absolute logit floor for gibberish
+    float feints_threshold = 0.5f,   // Second derivative threshold entering unwanted zone
+    float hearts_threshold = 0.2f,   // Second derivative threshold entering desired zone
+    int cut_strategy = 1             // 0=conservative, 1=balanced, 2=aggressive
+) {
+    if (candidates->size < 4) return;
+
+    /* SORT FOF DEBUG */
+    std::sort(
+        candidates->data,
+        candidates->data + candidates->size,
+        [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        }
+    );
+    printf("\nTop 5 logits: ");
+    for (size_t i = 0; i < std::min(candidates->size, (size_t)5); i++) {
+        printf("%.4f ", candidates->data[i].logit);
+    }
+    printf("\n\tBottom 5 logits: ");
+    for (size_t i = 0; i < std::min(candidates->size, (size_t)5); i++) {
+        printf("%.4f ", candidates->data[candidates->size-1-i].logit);
+    }
+    printf("\n");
+
+    // STEP 1: Check for HEADS (deterministic tokens)
+    // float max_logit = -INFINITY;
+    // for (size_t i = 0; i < candidates->size; i++) {
+    //     if (candidates->data[i].logit > max_logit) {
+    //         max_logit = candidates->data[i].logit;
+    //     }
+    // }
+    float max_logit = candidates->data[0].logit;
+    for (size_t i = 1; i < std::min(candidates->size, (size_t)10); i++) {
+        if ((candidates->data[i-1].logit - candidates->data[i].logit) / max_logit > 0.25) {
+            printf("[FRACTIONAL] HEADS MODE: Kept %zu/%zu tokens\n", i, candidates->size);
+            candidates->size = i;
+            return;
+        }
+    }
+    
+    // if (max_logit >= heads_cutoff) {
+    //     // Keep only heads - discard everything else
+    //     //size_t before_size = candidates->size;
+    //     auto new_end = std::remove_if(
+    //         candidates->data, 
+    //         candidates->data + candidates->size,
+    //         [heads_cutoff](const llama_token_data & candidate) {
+    //             return candidate.logit < heads_cutoff;
+    //         }
+    //     );
+    //     candidates->size = new_end - candidates->data;
+
+    //     // printf("[FRACTIONAL] HEADS MODE: Kept %zu/%zu tokens\n", candidates->size, before_size);
+    //     // printf("  Top 5 logits: ");
+    //     // for (size_t i = 0; i < std::min(candidates->size, (size_t)5); i++) {
+    //     //     printf("%.4f ", candidates->data[i].logit);
+    //     // }
+    //     // printf("\n");
+
+    //     return;
+    // }
+    
+    // // STEP 2: Remove TAILS (gibberish)
+    // auto new_end = std::remove_if(
+    //     candidates->data,
+    //     candidates->data + candidates->size,
+    //     [tails_cutoff](const llama_token_data & candidate) {
+    //         return candidate.logit < tails_cutoff;
+    //     }
+    // );
+    // size_t before_tails = candidates->size;
+    // candidates->size = new_end - candidates->data;
+
+    // printf("[FRACTIONAL] TAILS: Removed %zu gibberish tokens (cutoff: %.4f)\n", before_tails - candidates->size, tails_cutoff);
+    
+    // if (candidates->size < 4) return;
+    
+    // STEP 3: Sort by logit descending for elbow detection
+    // std::sort(
+    //     candidates->data,
+    //     candidates->data + candidates->size,
+    //     [](const llama_token_data & a, const llama_token_data & b) {
+    //         return a.logit > b.logit;
+    //     }
+    // );
+
+    // printf("[FRACTIONAL] After tails removal - Bottom 10 logits: ");
+    // for (size_t i = 0; i < std::min(candidates->size, (size_t)10); i++) {
+    //     printf("%.4f ", candidates->data[candidates->size-1-i].logit);
+    // }
+    // printf("\n");
+    
+    // STEP 4: Find the transition from FEINTS to HEARTS using second derivative
+    int entering_hearts = -1;
+    int exiting_feints = -1;
+    
+    for (size_t i = 2; i < std::min(candidates->size, (size_t)50); i++) {
+        float drop1 = candidates->data[i-2].logit - candidates->data[i-1].logit;
+        float drop2 = candidates->data[i-1].logit - candidates->data[i].logit;
+        float second_deriv = drop1 - drop2;
+        
+        if (entering_hearts == -1 && second_deriv >= feints_threshold) {
+            entering_hearts = i;
+        }
+        
+        if (entering_hearts != -1 && second_deriv <= hearts_threshold) {
+            exiting_feints = i;
+            break;
+        }
+    }
+    
+    // STEP 5: Apply cut if we found the transition zone
+    if (entering_hearts != -1) {
+        int cutpoint;
+        if (exiting_feints == -1) {
+            cutpoint = entering_hearts;
+        } else {
+            switch(cut_strategy) {
+                case 0: // Conservative - keep more hearts
+                    cutpoint = entering_hearts;
+                    break;
+                case 1: // Balanced - midpoint
+                    cutpoint = (entering_hearts + exiting_feints) / 2;
+                    break;
+                case 2: // Aggressive - cut more feints
+                    cutpoint = exiting_feints;
+                    break;
+                default:
+                    cutpoint = entering_hearts;
+            }
+        }
+
+        printf("[FRACTIONAL] Elbow found: entering=%d, exiting=%d, cutpoint=%d (strategy=%d)\n", entering_hearts, exiting_feints, cutpoint, cut_strategy);
+        printf("  Cutpoint logit: %.4f\n", candidates->data[cutpoint].logit);
+        
+        // Discard feints (tokens before cutpoint - higher logits)
+        size_t before_cut = candidates->size;
+        float cutpoint_logit = candidates->data[cutpoint].logit;
+        auto new_end = std::remove_if(
+            candidates->data,
+            candidates->data + candidates->size,
+            [cutpoint_logit](const llama_token_data & candidate) {
+                return candidate.logit > cutpoint_logit;
+            }
+        );
+        candidates->size = new_end - candidates->data;
+
+        printf("[FRACTIONAL] FEINTS CUT: Removed %zu cliche tokens, kept %zu hearts\n", before_cut - candidates->size, candidates->size);
+    }
+    else {
+        printf("[FRACTIONAL] No elbow detected - keeping all non-tail tokens (%zu)\n", candidates->size);
+    }
+
+    // STEP 2: Remove TAILS (gibberish)
+    max_logit = candidates->data[0].logit;
+    auto new_end = std::remove_if(
+        candidates->data,
+        candidates->data + candidates->size,
+        [max_logit](const llama_token_data & candidate) {
+            return candidate.logit < max_logit - 2.f;
+        }
+    );
+    size_t before_tails = candidates->size;
+    candidates->size = new_end - candidates->data;
+
+    printf("[FRACTIONAL] TAILS: Removed %zu gibberish tokens (cutoff: %.4f)\n", before_tails - candidates->size, max_logit - 2.f);
+
+}
+
 int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float rep_pen_slope, float presence_penalty, float top_k, float top_a, float top_p, float min_p, float typical_p, float tfs, float nsigma, float temp, std::mt19937 & rng,
 int mirostat, float mirostat_tau, float mirostat_eta, float dry_multiplier, float dry_base, int dry_allowed_length, int dry_penalty_last_n, float xtc_threshold, float xtc_probability,
 const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dynatemp_range, float dynatemp_exponent, float smoothing_factor)
@@ -1658,14 +1833,15 @@ const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dyna
 
     llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
 
-    //dry always first as logits cannot be resorted
-    sample_dry(n_ctx, dry_penalty_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_sequence_breakers, &candidates_p);
+    // //dry always first as logits cannot be resorted
+    // sample_dry(n_ctx, dry_penalty_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_sequence_breakers, &candidates_p);
 
     //prefilter to top 3k tokens for improved speed
     bool use_grammar = grammar != nullptr;
     std::vector<llama_token_data> precache = (use_grammar ? std::vector<llama_token_data>(candidates) : std::vector<llama_token_data>(0));
 
-    sample_top_k(&candidates_p, 3000);
+    // sample_top_k(&candidates_p, 3000);
+    sample_fractional(&candidates_p);
 
     if (use_grammar) {
         sample_grammar(file_format, n_vocab, &candidates_p, grammar);
@@ -1673,79 +1849,81 @@ const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dyna
         if (candidates_p.size <= 0) {
             candidates_p = { precache.data(), precache.size(), false };
             sample_grammar(file_format, n_vocab, &candidates_p, grammar);
-            sample_top_k(&candidates_p, 3000);
+            sample_fractional(&candidates_p);
+            // sample_top_k(&candidates_p, 3000);
         }
     }
+    id = sample_token(&candidates_p, rng);
 
-    if (mirostat == 1 || mirostat == 2)
-    {
-        static float mirostat_mu = 2.0f * mirostat_tau;
-        const int mirostat_m = 100;
-        sample_rep_pen(n_ctx, rep_pen_range, rep_pen, rep_pen_slope, presence_penalty, &candidates_p);
-        sample_temperature(&candidates_p, temp, smoothing_factor);
-        if (mirostat == 1)
-        {
-            id = sample_token_mirostat(n_vocab, &candidates_p, rng, mirostat_tau, mirostat_eta, mirostat_m, &mirostat_mu);
-        }
-        else
-        {
-            id = sample_token_mirostat_v2(&candidates_p, rng, mirostat_tau, mirostat_eta, &mirostat_mu);
-        }
-    }
-    else
-    {
-        for (int i = 0; i < sampler_order.size(); i++)
-        {
-            switch (sampler_order[i])
-            {
-                case KCPP_SAMPLER_TOP_K:
-                    sample_top_k(&candidates_p, top_k);
-                    break;
-                case KCPP_SAMPLER_TOP_A:
-                    sample_top_a(&candidates_p, top_a, 1);
-                    break;
-                case KCPP_SAMPLER_TOP_P:
-                    sample_top_p(&candidates_p, top_p, 1);
-                    sample_min_p(&candidates_p, min_p, 1);
-                    break;
-                case KCPP_SAMPLER_TFS:
-                    sample_tail_free(&candidates_p, tfs, 1);
-                    break;
-                case KCPP_SAMPLER_TYP:
-                    sampler_typical(&candidates_p, typical_p, 1);
-                    break;
-                case KCPP_SAMPLER_TEMP:
-                    if (dynatemp_range!=0)
-                    {
-                        float dynatemp_min = temp - dynatemp_range;
-                        float dynatemp_max = temp + dynatemp_range;
-                        //do not allow negative values
-                        dynatemp_min = dynatemp_min<0?0:dynatemp_min;
-                        dynatemp_max = dynatemp_max<0?0:dynatemp_max;
-                        dynatemp_exponent = dynatemp_exponent<0?0:dynatemp_exponent;
-                        sample_entropy(&candidates_p, dynatemp_min, dynatemp_max, dynatemp_exponent, smoothing_factor);
-                    }
-                    else
-                    {
-                        sample_temperature(&candidates_p, temp, smoothing_factor);
-                    }
-                    if (nsigma > 0.0f)
-                    {
-                        sample_top_n_sigma(&candidates_p, nsigma);
-                    }
-                    break;
-                case KCPP_SAMPLER_REP_PEN:
-                    sample_rep_pen(n_ctx, rep_pen_range, rep_pen, rep_pen_slope, presence_penalty, &candidates_p);
-                    break;
-                default:
-                    printf("\nSampleLogits: Unknown Sampler : %d",sampler_order[i]);
-                    break;
-            }
-        }
-        //xtc always last
-        sample_xtc(&candidates_p, xtc_threshold, xtc_probability, rng);
-        id = sample_token(&candidates_p, rng);
-    }
+    // if (mirostat == 1 || mirostat == 2)
+    // {
+    //     static float mirostat_mu = 2.0f * mirostat_tau;
+    //     const int mirostat_m = 100;
+    //     sample_rep_pen(n_ctx, rep_pen_range, rep_pen, rep_pen_slope, presence_penalty, &candidates_p);
+    //     sample_temperature(&candidates_p, temp, smoothing_factor);
+    //     if (mirostat == 1)
+    //     {
+    //         id = sample_token_mirostat(n_vocab, &candidates_p, rng, mirostat_tau, mirostat_eta, mirostat_m, &mirostat_mu);
+    //     }
+    //     else
+    //     {
+    //         id = sample_token_mirostat_v2(&candidates_p, rng, mirostat_tau, mirostat_eta, &mirostat_mu);
+    //     }
+    // }
+    // else
+    // {
+    //     for (int i = 0; i < sampler_order.size(); i++)
+    //     {
+    //         switch (sampler_order[i])
+    //         {
+    //             case KCPP_SAMPLER_TOP_K:
+    //                 sample_top_k(&candidates_p, top_k);
+    //                 break;
+    //             case KCPP_SAMPLER_TOP_A:
+    //                 sample_top_a(&candidates_p, top_a, 1);
+    //                 break;
+    //             case KCPP_SAMPLER_TOP_P:
+    //                 sample_top_p(&candidates_p, top_p, 1);
+    //                 sample_min_p(&candidates_p, min_p, 1);
+    //                 break;
+    //             case KCPP_SAMPLER_TFS:
+    //                 sample_tail_free(&candidates_p, tfs, 1);
+    //                 break;
+    //             case KCPP_SAMPLER_TYP:
+    //                 sampler_typical(&candidates_p, typical_p, 1);
+    //                 break;
+    //             case KCPP_SAMPLER_TEMP:
+    //                 if (dynatemp_range!=0)
+    //                 {
+    //                     float dynatemp_min = temp - dynatemp_range;
+    //                     float dynatemp_max = temp + dynatemp_range;
+    //                     //do not allow negative values
+    //                     dynatemp_min = dynatemp_min<0?0:dynatemp_min;
+    //                     dynatemp_max = dynatemp_max<0?0:dynatemp_max;
+    //                     dynatemp_exponent = dynatemp_exponent<0?0:dynatemp_exponent;
+    //                     sample_entropy(&candidates_p, dynatemp_min, dynatemp_max, dynatemp_exponent, smoothing_factor);
+    //                 }
+    //                 else
+    //                 {
+    //                     sample_temperature(&candidates_p, temp, smoothing_factor);
+    //                 }
+    //                 if (nsigma > 0.0f)
+    //                 {
+    //                     sample_top_n_sigma(&candidates_p, nsigma);
+    //                 }
+    //                 break;
+    //             case KCPP_SAMPLER_REP_PEN:
+    //                 sample_rep_pen(n_ctx, rep_pen_range, rep_pen, rep_pen_slope, presence_penalty, &candidates_p);
+    //                 break;
+    //             default:
+    //                 printf("\nSampleLogits: Unknown Sampler : %d",sampler_order[i]);
+    //                 break;
+    //         }
+    //     }
+    //     //xtc always last
+    //     sample_xtc(&candidates_p, xtc_threshold, xtc_probability, rng);
+    //     id = sample_token(&candidates_p, rng);
+    // }
 
     return id;
 }
