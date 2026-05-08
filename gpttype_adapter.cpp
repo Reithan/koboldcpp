@@ -2014,7 +2014,8 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
         cur_p->data[i].logit = logf(fmaxf(cur_p->data[i].p, 1e-10f));
     }
 
-    cur_p->sorted = false;
+    // Tokens remain sorted: lerp between two descending sequences preserves order
+    cur_p->sorted = true;
 }
 
 void sample_top_n_sigma(llama_token_data_array * cur_p, float nsigma) {
@@ -2421,10 +2422,8 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
                 case KCPP_SAMPLER_TFS:
                     sample_tail_free(&candidates_p, tfs, 1);
                     // Process sigmoid sampler immediately after TFS, no enum changes needed
-                    if (sigmoid_strength > 0.0f) {
-                        sample_sigmoid_shape(&candidates_p, sigmoid_top, sigmoid_slope_end,
-                                             sigmoid_bottom, sigmoid_height, sigmoid_strength);
-                    }
+                    sample_sigmoid_shape(&candidates_p, sigmoid_top, sigmoid_slope_end,
+                                            sigmoid_bottom, sigmoid_height, sigmoid_strength);
                     break;
                 case KCPP_SAMPLER_TYP:
                     sampler_typical(&candidates_p, typical_p, 1);
