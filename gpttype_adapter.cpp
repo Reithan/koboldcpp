@@ -2005,6 +2005,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
                           float top, float slope, float bottom,
                           float height, float strength,
                           bool* probabilities_normalized = nullptr) {
+    // enforce landmark sorting invariant
     if (cur_p->size <= 1 || strength <= 0.0f) return;
     if(slope < top || bottom < slope)
     {
@@ -2020,6 +2021,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     float cumsum = 0.0f;
     float top_logit = max_logit, slope_logit = max_logit, bottom_logit = max_logit;
     bool found_top = false, found_slope = false;
+    size_t target_length = cur_p->size;
 
     for (size_t i = 0; i < cur_p->size; ++i) {
         cumsum += cur_p->data[i].p;
@@ -2033,6 +2035,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
         }
         if (cumsum >= bottom) {
             bottom_logit = cur_p->data[i].logit;
+            target_length = i+1;
             break;
         }
     }
@@ -2040,51 +2043,46 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     // Compute sigmoid parameters using standard form
     float slope_mid = 0.5f * (top_logit + slope_logit);
     float mid = 0.5f * (max_logit + bottom_logit);
-    float k = fmaxf(1e-6f, (top_logit - slope_logit) / fmaxf(1e-6f, max_logit - bottom_logit));
+    float k = 1.0f / fmaxf(1e-6f, (top_logit - slope_logit) / fmaxf(1e-6f, max_logit - bottom_logit));
 
     float min_val = mid - height * (mid - bottom_logit);
     float sig_range = height * (max_logit - bottom_logit);
 
-    // Optimization: pre-allocate target probabilities to avoid duplicate sigmoid calculations
-    std::vector<float> target_probs(cur_p->size);
+    // Optimization: pre-allocate target logits to avoid duplicate sigmoid calculations
+    std::vector<float> target_logits(cur_p->size);
 
-    // Pass 2: Compute target probabilities and sum
+    // Pass 2: Compute target logit and sum
     float target_sum = 0.0f;
-    for (size_t i = 0; i < cur_p->size; ++i) {
+    for (size_t i = 0; i < target_length; ++i) {
         float sigmoid_val = 1.0f / (1.0f + expf(-k * (cur_p->data[i].logit - slope_mid)));
-        target_probs[i] = min_val + sig_range * sigmoid_val;
-        target_sum += target_probs[i];
+        target_logits[i] = min_val + sig_range * sigmoid_val;
+        target_sum += target_logits[i];
     }
 
     // Pass 3: normalize + lerp + cutoff (using pre-computed values)
     cumsum = 0.0f;
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        float t_norm = target_probs[i] / target_sum;
+    for (size_t i = 0; i < target_length; ++i) {
+        float t_norm = target_logits[i] / target_sum;
 
+        // normalizing the target logits gives 0..1 'probability' space
         cur_p->data[i].p = (1.0f - strength) * cur_p->data[i].p + strength * t_norm;
         cumsum += cur_p->data[i].p;
-
-        if (cumsum >= bottom) {
-            cur_p->size = i + 1;
-            break;
-        }
     }
 
-    // Pass 4: renormalize + sync logits
-    // NOTE: Cannot skip this step because:
-    // 1. Preserves probability floor - prevents tail tokens from approaching 0%
-    // 2. Without logit sync, downstream softmax would revert to original distribution
-    // 3. The controlled probability floor is a key feature distinguishing sigmoid
-    //    from traditional softmax (e.g. [0.4,0.25,0.2,0.1,0.1] vs [0.6,0.3,0.2,0.0,0.0])
-    for (size_t i = 0; i < cur_p->size; ++i) {
+    // Pass 4: renormalize outputs
+    // Preserves probability floor - prevents tail tokens from approaching 0%
+    // The controlled probability floor is a key feature distinguishing sigmoid
+    //   from traditional softmax (e.g. [0.4,0.25,0.2,0.1,0.1] vs [0.6,0.3,0.2,0.0,0.0])
+    for (size_t i = 0; i < target_length; ++i) {
         cur_p->data[i].p /= cumsum;
-        cur_p->data[i].logit = logf(fmaxf(cur_p->data[i].p, 1e-10f));
     }
 
     // Tokens remain sorted: lerp between two descending sequences preserves order
     cur_p->sorted = true;
+    cur_p->size = target_length;
     
     // Set flag indicating probabilities are normalized
+    //   to avoid spurious re-softmaxing if avoidable
     if (probabilities_normalized) {
         *probabilities_normalized = true;
     }
