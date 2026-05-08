@@ -56,7 +56,7 @@ struct kcpp_params {
     float adaptive_decay       = 0.9f;
     int reasoning_budget       = 0; //if > 0, controls thinking budget
     float sigmoid_top          = 0.2f;
-    float sigmoid_slope_end    = 0.8f;
+    float sigmoid_slope        = 0.8f;
     float sigmoid_bottom       = 0.95f;
     float sigmoid_height       = 1.0f;
     float sigmoid_strength     = 0.0f; // 0.0 - 1.0, <= 0.0 is disabled

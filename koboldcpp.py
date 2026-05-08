@@ -369,7 +369,7 @@ class generation_inputs(ctypes.Structure):
                 ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
                 ("reasoning_budget", ctypes.c_int),
                 ("sigmoid_top", ctypes.c_float),
-                ("sigmoid_slope_end", ctypes.c_float),
+                ("sigmoid_slope", ctypes.c_float),
                 ("sigmoid_bottom", ctypes.c_float),
                 ("sigmoid_height", ctypes.c_float),
                 ("sigmoid_strength", ctypes.c_float)]
@@ -2121,7 +2121,7 @@ def generate(genparams, stream_flag=False):
     typical_p = tryparsefloat(genparams.get('typical', 1.0),1.0)
     tfs = tryparsefloat(genparams.get('tfs', 1.0),1.0)
     sigmoid_top = tryparsefloat(genparams.get('sigmoid_top', 0.2), 0.2)
-    sigmoid_slope_end = tryparsefloat(genparams.get('sigmoid_slope_end', 0.8), 0.8)
+    sigmoid_slope = tryparsefloat(genparams.get('sigmoid_slope', 0.8), 0.8)
     sigmoid_bottom = tryparsefloat(genparams.get('sigmoid_bottom', 0.95), 0.95)
     sigmoid_height = tryparsefloat(genparams.get('sigmoid_height', 1.0), 1.0)
     sigmoid_strength = tryparsefloat(genparams.get('sigmoid_strength', 1.0), 1.0)
@@ -2239,7 +2239,7 @@ def generate(genparams, stream_flag=False):
     inputs.typical_p = typical_p
     inputs.tfs = tfs
     inputs.sigmoid_top = sigmoid_top
-    inputs.sigmoid_slope_end = sigmoid_slope_end
+    inputs.sigmoid_slope = sigmoid_slope
     inputs.sigmoid_bottom = sigmoid_bottom
     inputs.sigmoid_height = sigmoid_height
     inputs.sigmoid_strength = sigmoid_strength
