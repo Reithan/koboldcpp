@@ -52,9 +52,14 @@ struct kcpp_params {
     float xtc_probability      = 0;
     float   dynatemp_range     = 0.0f;  // enables DynaTemp if neq 0. dynatemp_min = temperature - dt_range, dynatemp_max = temperature + dt_range
     float   dynatemp_exponent  = 1.0f;
-    float adaptive_target     = -1.0f; // 0.0 - 1.0, <=0.0 is disabled
-    float adaptive_decay      = 0.9f;
+    float adaptive_target      = -1.0f; // 0.0 - 1.0, <=0.0 is disabled
+    float adaptive_decay       = 0.9f;
     int reasoning_budget       = 0; //if > 0, controls thinking budget
+    float sigmoid_top          = 0.2f;
+    float sigmoid_slope_end    = 0.8f;
+    float sigmoid_bottom       = 0.95f;
+    float sigmoid_height       = 1.0f;
+    float sigmoid_strength     = 0.0f; // 0.0 - 1.0, <= 0.0 is disabled
 
     std::string model_filename       = ""; // model path
     std::string prompt               = "";

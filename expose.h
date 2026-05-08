@@ -151,7 +151,7 @@ struct generation_inputs
     const float sigmoid_slope_end = 0.8f;
     const float sigmoid_bottom = 0.95f;
     const float sigmoid_height = 1.0f;
-    const float sigmoid_strength = 1.0f;
+    const float sigmoid_strength = 0.0f;
 };
 struct generation_outputs
 {
