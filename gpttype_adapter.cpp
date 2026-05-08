@@ -2177,7 +2177,7 @@ void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_te
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
     if (smoothing_factor > 0 && cur_p->size > 1) {
         if (probabilities_normalized && !(*probabilities_normalized)) {
-            sample_softmax(candidates_p);
+            sample_softmax(cur_p);
         }
         float h = cur_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
         // Apply the modified quadratic transformation using the smoothing_factor and smoothing_curve
