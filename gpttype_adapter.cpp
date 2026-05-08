@@ -2006,7 +2006,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
                           float height, float strength,
                           bool* probabilities_normalized = nullptr) {
     // enforce landmark sorting invariant
-    if (cur_p->size <= 1 || strength <= 0.0f) return;
+    if (cur_p->size < 3 || strength <= 0.0f) return;
     if(slope < top || bottom < slope)
     {
         throw std::runtime_error("Sigmoid sampler thresholds must be orderd top <= slope <= bottom!");
@@ -2019,7 +2019,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     // Pass 1: Find logit landmarks at cumulative probability thresholds
     float max_logit = cur_p->data[0].logit;
     float cumsum = 0.0f;
-    float top_logit = max_logit, slope_logit = max_logit, bottom_logit = max_logit;
+    float top_logit = cur_p->data[0].logit, slope_logit = cur_p->data[1].logit, bottom_logit = cur_p->data[2].logit;
     bool found_top = false, found_slope = false;
     size_t target_length = cur_p->size;
 
@@ -2029,32 +2029,39 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
             top_logit = cur_p->data[i].logit;
             found_top = true;
         }
-        if (!found_slope && cumsum >= slope) {
+        else if (!found_slope && cumsum >= slope) {
             slope_logit = cur_p->data[i].logit;
             found_slope = true;
         }
-        if (cumsum >= bottom) {
+        else if (cumsum >= bottom) {
             bottom_logit = cur_p->data[i].logit;
             target_length = i+1;
             break;
         }
     }
+    if(slope_logit < top_logit || bottom_logit < slope_logit)
+    {
+        throw std::runtime_error("Sigmoid landmarks out of order, this shouldn't happen!");
+    }
 
     // Compute sigmoid parameters using standard form
     float slope_mid = 0.5f * (top_logit + slope_logit);
     float mid = 0.5f * (max_logit + bottom_logit);
-    float k = 1.0f / fmaxf(1e-6f, (top_logit - slope_logit) / fmaxf(1e-6f, max_logit - bottom_logit));
+    float transition_range = fmaxf(1e-6f, top_logit - slope_logit);
+    float total_range = fmaxf(1e-6f, max_logit - bottom_logit);
+    float k = 1.0f / fmaxf(1e-6f, transition_range / total_range);
 
     float min_val = mid - height * (mid - bottom_logit);
-    float sig_range = height * (max_logit - bottom_logit);
+    float sig_range = fmaxf(1e-6f, height * (max_logit - bottom_logit));
 
     // Optimization: pre-allocate target logits to avoid duplicate sigmoid calculations
     std::vector<float> target_logits(cur_p->size);
+    float max_exp = logf(std::numeric_limits<float>::max()) / target_length;
 
     // Pass 2: Compute target logit and sum
     float target_sum = 0.0f;
     for (size_t i = 0; i < target_length; ++i) {
-        float sigmoid_val = 1.0f / (1.0f + expf(-k * (cur_p->data[i].logit - slope_mid)));
+        float sigmoid_val = 1.0f / (1.0f + expf(-k * (fminf(max_exp, fmaxf(-max_exp, cur_p->data[i].logit - slope_mid)))));
         target_logits[i] = min_val + sig_range * sigmoid_val;
         target_sum += target_logits[i];
     }
