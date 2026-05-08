@@ -147,6 +147,11 @@ struct generation_inputs
     const int banned_tokens_len = 0;
     const char ** banned_tokens = nullptr;
     const int reasoning_budget = -1;
+    const float sigmoid_top = 0.2f;
+    const float sigmoid_slope_end = 0.8f;
+    const float sigmoid_bottom = 0.95f;
+    const float sigmoid_height = 1.0f;
+    const float sigmoid_strength = 1.0f;
 };
 struct generation_outputs
 {

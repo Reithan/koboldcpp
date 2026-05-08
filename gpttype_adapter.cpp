@@ -1952,6 +1952,71 @@ void sampler_typical(llama_token_data_array * cur_p, float p, size_t min_keep) {
     cur_p->sorted = false;
 }
 
+void sample_sigmoid_shape(llama_token_data_array * cur_p,
+                          float top, float slope_end, float bottom,
+                          float height, float strength) {
+    if (cur_p->size <= 1 || strength <= 0.0f) return;
+
+    // Note: sample_softmax is always needed. cur_p->sorted=true only means tokens
+    // are sorted by logit value, NOT that probabilities are computed. For example,
+    // sample_top_k sets sorted=true after sorting but never calls sample_softmax.
+    sample_softmax(cur_p);
+
+    // Pass 1: find logit landmarks at cumulative probability thresholds
+    float max_logit = cur_p->data[0].logit;
+    float cumsum = 0.0f;
+    float dist_top = 0.0f, dist_slope = 0.0f;
+    bool found_top = false, found_slope = false;
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cumsum += cur_p->data[i].p;
+        if (!found_top && cumsum >= top) {
+            dist_top = max_logit - cur_p->data[i].logit;
+            found_top = true;
+        }
+        if (!found_slope && cumsum >= slope_end) {
+            dist_slope = max_logit - cur_p->data[i].logit;
+            found_slope = true;
+            break;
+        }
+    }
+
+    float midpoint = (dist_top + dist_slope) * 0.5f;
+    float k = 6.0f / fmaxf(dist_slope - dist_top, 1e-6f);
+
+    // Pass 2: compute target sum
+    float target_sum = 0.0f;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        float dist = max_logit - cur_p->data[i].logit;
+        float sig = 1.0f / (1.0f + expf(-k * (dist - midpoint)));
+        target_sum += 1.0f - height * sig;
+    }
+
+    // Pass 3: normalize + lerp + cutoff (merged)
+    cumsum = 0.0f;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        float dist = max_logit - cur_p->data[i].logit;
+        float sig = 1.0f / (1.0f + expf(-k * (dist - midpoint)));
+        float t_norm = (1.0f - height * sig) / target_sum;
+
+        cur_p->data[i].p = (1.0f - strength) * cur_p->data[i].p + strength * t_norm;
+        cumsum += cur_p->data[i].p;
+
+        if (cumsum >= bottom) {
+            cur_p->size = i + 1;
+            break;
+        }
+    }
+
+    // Pass 4: renormalize + sync logits
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p /= cumsum;
+        cur_p->data[i].logit = logf(fmaxf(cur_p->data[i].p, 1e-10f));
+    }
+
+    cur_p->sorted = false;
+}
+
 void sample_top_n_sigma(llama_token_data_array * cur_p, float nsigma) {
     if (nsigma <= 0.0f || cur_p->size <= 1) {
         return;
@@ -2268,6 +2333,7 @@ static int apply_reasoning_budget(int id, const std::vector<int> & start_think, 
 
 int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float rep_pen_slope, float presence_penalty, float top_k, float top_a, float top_p, float min_p, float typical_p, float tfs, float nsigma, float temp, std::mt19937 & rng,
 int mirostat, float mirostat_tau, float mirostat_eta, float dry_multiplier, float dry_base, int dry_allowed_length, int dry_penalty_last_n, float xtc_threshold, float xtc_probability,
+float sigmoid_top, float sigmoid_slope_end, float sigmoid_bottom, float sigmoid_height, float sigmoid_strength,
 const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dynatemp_range, float dynatemp_exponent, float smoothing_factor, float smoothing_curve, float adaptive_target,
 const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq, std::vector<int> & think_end_phrase_toks, int reasoning_budget)
 {
@@ -2354,6 +2420,11 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
                     break;
                 case KCPP_SAMPLER_TFS:
                     sample_tail_free(&candidates_p, tfs, 1);
+                    // Process sigmoid sampler immediately after TFS, no enum changes needed
+                    if (sigmoid_strength > 0.0f) {
+                        sample_sigmoid_shape(&candidates_p, sigmoid_top, sigmoid_slope_end,
+                                             sigmoid_bottom, sigmoid_height, sigmoid_strength);
+                    }
                     break;
                 case KCPP_SAMPLER_TYP:
                     sampler_typical(&candidates_p, typical_p, 1);
@@ -6863,6 +6934,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 kcpp_data->mirostat, kcpp_data->mirostat_tau, kcpp_data->mirostat_eta,
                 kcpp_data->dry_multiplier, kcpp_data->dry_base,
                 kcpp_data->dry_allowed_length, kcpp_data->dry_penalty_last_n, kcpp_data->xtc_threshold, kcpp_data->xtc_probability,
+                kcpp_data->sigmoid_top, kcpp_data->sigmoid_slope_end, kcpp_data->sigmoid_bottom, kcpp_data->sigmoid_height, kcpp_data->sigmoid_strength,
                 sampler_order, grammar, dynatemp_range, dynatemp_exponent, smoothing_factor, smoothing_curve, adaptive_target,
                 thinking_start_sequence, thinking_end_sequence, thinking_end_phrase_toksleft, kcpp_data->reasoning_budget);
 

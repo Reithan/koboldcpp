@@ -367,7 +367,12 @@ class generation_inputs(ctypes.Structure):
                 ("logit_biases", ctypes.POINTER(logit_bias)),
                 ("banned_tokens_len", ctypes.c_int),
                 ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
-                ("reasoning_budget", ctypes.c_int)]
+                ("reasoning_budget", ctypes.c_int),
+                ("sigmoid_top", ctypes.c_float),
+                ("sigmoid_slope_end", ctypes.c_float),
+                ("sigmoid_bottom", ctypes.c_float),
+                ("sigmoid_height", ctypes.c_float),
+                ("sigmoid_strength", ctypes.c_float)]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -2115,6 +2120,11 @@ def generate(genparams, stream_flag=False):
     min_p = tryparsefloat(genparams.get('min_p', adapter_obj.get("min_p", 0.0)),0.0)
     typical_p = tryparsefloat(genparams.get('typical', 1.0),1.0)
     tfs = tryparsefloat(genparams.get('tfs', 1.0),1.0)
+    sigmoid_top = tryparsefloat(genparams.get('sigmoid_top', 0.2), 0.2)
+    sigmoid_slope_end = tryparsefloat(genparams.get('sigmoid_slope_end', 0.8), 0.8)
+    sigmoid_bottom = tryparsefloat(genparams.get('sigmoid_bottom', 0.95), 0.95)
+    sigmoid_height = tryparsefloat(genparams.get('sigmoid_height', 1.0), 1.0)
+    sigmoid_strength = tryparsefloat(genparams.get('sigmoid_strength', 1.0), 1.0)
     nsigma = tryparsefloat(genparams.get('nsigma', 0.0),0.0)
     rep_pen = tryparsefloat(genparams.get('rep_pen', adapter_obj.get("rep_pen", 1.0)),1.0)
     rep_pen_range = tryparseint(genparams.get('rep_pen_range', 320),320)
@@ -2228,6 +2238,11 @@ def generate(genparams, stream_flag=False):
     inputs.min_p = min_p
     inputs.typical_p = typical_p
     inputs.tfs = tfs
+    inputs.sigmoid_top = sigmoid_top
+    inputs.sigmoid_slope_end = sigmoid_slope_end
+    inputs.sigmoid_bottom = sigmoid_bottom
+    inputs.sigmoid_height = sigmoid_height
+    inputs.sigmoid_strength = sigmoid_strength
     inputs.nsigma = nsigma
     inputs.rep_pen = rep_pen
     inputs.rep_pen_range = rep_pen_range
