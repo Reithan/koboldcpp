@@ -1966,42 +1966,51 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     // sample_top_k sets sorted=true after sorting but never calls sample_softmax.
     sample_softmax(cur_p);
 
-    // Pass 1: find logit landmarks at cumulative probability thresholds
+    // Pass 1: Find logit landmarks at cumulative probability thresholds
     float max_logit = cur_p->data[0].logit;
     float cumsum = 0.0f;
-    float dist_top = 0.0f, dist_slope = 0.0f;
+    float top_logit = max_logit, slope_logit = max_logit, bottom_logit = max_logit;
     bool found_top = false, found_slope = false;
 
     for (size_t i = 0; i < cur_p->size; ++i) {
         cumsum += cur_p->data[i].p;
         if (!found_top && cumsum >= top) {
-            dist_top = max_logit - cur_p->data[i].logit;
+            top_logit = cur_p->data[i].logit;
             found_top = true;
         }
         if (!found_slope && cumsum >= slope) {
-            dist_slope = max_logit - cur_p->data[i].logit;
+            slope_logit = cur_p->data[i].logit;
             found_slope = true;
+        }
+        if (cumsum >= bottom) {
+            bottom_logit = cur_p->data[i].logit;
             break;
         }
     }
 
-    float midpoint = (dist_top + dist_slope) * 0.5f;
-    float k = 6.0f / fmaxf(dist_slope - dist_top, 1e-6f);
+    // Compute sigmoid parameters using standard form
+    float slope_mid = 0.5f * (top_logit + slope_logit);
+    float mid = 0.5f * (max_logit + bottom_logit);
+    float k = fmaxf(1e-6f, (top_logit - slope_logit) / fmaxf(1e-6f, max_logit - bottom_logit));
 
-    // Pass 2: compute target sum
+    float min_val = mid - height * (mid - bottom_logit);
+    float sig_range = height * (max_logit - bottom_logit);
+
+    // Optimization: pre-allocate target probabilities to avoid duplicate sigmoid calculations
+    std::vector<float> target_probs(cur_p->size);
+
+    // Pass 2: Compute target probabilities and sum
     float target_sum = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        float dist = max_logit - cur_p->data[i].logit;
-        float sig = 1.0f / (1.0f + expf(-k * (dist - midpoint)));
-        target_sum += 1.0f - height * sig;
+        float sigmoid_val = 1.0f / (1.0f + expf(-k * (cur_p->data[i].logit - slope_mid)));
+        target_probs[i] = min_val + sig_range * sigmoid_val;
+        target_sum += target_probs[i];
     }
 
-    // Pass 3: normalize + lerp + cutoff (merged)
+    // Pass 3: normalize + lerp + cutoff (using pre-computed values)
     cumsum = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        float dist = max_logit - cur_p->data[i].logit;
-        float sig = 1.0f / (1.0f + expf(-k * (dist - midpoint)));
-        float t_norm = (1.0f - height * sig) / target_sum;
+        float t_norm = target_probs[i] / target_sum;
 
         cur_p->data[i].p = (1.0f - strength) * cur_p->data[i].p + strength * t_norm;
         cumsum += cur_p->data[i].p;
@@ -2013,6 +2022,11 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     }
 
     // Pass 4: renormalize + sync logits
+    // NOTE: Cannot skip this step because:
+    // 1. Preserves probability floor - prevents tail tokens from approaching 0%
+    // 2. Without logit sync, downstream softmax would revert to original distribution
+    // 3. The controlled probability floor is a key feature distinguishing sigmoid
+    //    from traditional softmax (e.g. [0.4,0.25,0.2,0.1,0.1] vs [0.6,0.3,0.2,0.0,0.0])
     for (size_t i = 0; i < cur_p->size; ++i) {
         cur_p->data[i].p /= cumsum;
         cur_p->data[i].logit = logf(fmaxf(cur_p->data[i].p, 1e-10f));
