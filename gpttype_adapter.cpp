@@ -1166,6 +1166,9 @@ void sample_top_k(llama_token_data_array * cur_p, int32_t k, bool* probabilities
     k = std::max(k, (int) 1); //min keep of 1
     k = std::min(k, (int) cur_p->size);
 
+    if (cur_p->size == k)
+        return;
+
     // Sort scores in descending order
     if (!cur_p->sorted) {
         auto comp = [](const llama_token_data & a, const llama_token_data & b) {
@@ -2009,87 +2012,80 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     if (cur_p->size < 3 || strength <= 0.0f) return;
     if(slope < top || bottom < slope)
     {
-        throw std::runtime_error("Sigmoid sampler thresholds must be orderd top <= slope <= bottom!");
+        throw std::runtime_error("Sigmoid sampler thresholds must be ordered top <= slope <= bottom!");
     }
 
     if (probabilities_normalized && !(*probabilities_normalized)) {
         sample_softmax(cur_p);
     }
+    else if (!cur_p->sorted) {
+        std::sort(cur_p->data, cur_p->data + cur_p->size, [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        });
+        cur_p->sorted = true;
+    }
 
-    // Pass 1: Find logit landmarks at cumulative probability thresholds
-    float max_logit = cur_p->data[0].logit;
+    // Pass 1: Find landmarks at cumulative probability thresholds
+    size_t top_i = 0,
+           target_length = cur_p->size;
+    size_t slope_i = target_length / 2;
+    float max_p = cur_p->data[top_i].p,
+          min_p = cur_p->data[target_length-1].p;
+
     float cumsum = 0.0f;
-    float top_logit = cur_p->data[0].logit, slope_logit = cur_p->data[1].logit, bottom_logit = cur_p->data[2].logit;
     bool found_top = false, found_slope = false;
-    size_t target_length = cur_p->size;
 
     for (size_t i = 0; i < cur_p->size; ++i) {
         cumsum += cur_p->data[i].p;
         if (!found_top && cumsum >= top) {
-            top_logit = cur_p->data[i].logit;
+            top_i = i;
             found_top = true;
         }
         else if (!found_slope && cumsum >= slope) {
-            slope_logit = cur_p->data[i].logit;
+            slope_i = i;
             found_slope = true;
         }
         else if (cumsum >= bottom) {
-            bottom_logit = cur_p->data[i].logit;
+            min_p = cur_p->data[i].p;
             target_length = i+1;
             break;
         }
     }
-    if(slope_logit < top_logit || bottom_logit < slope_logit)
+    if(target_length < 3 || top_i > slope_i || slope_i > target_length - 1)
     {
         throw std::runtime_error("Sigmoid landmarks out of order, this shouldn't happen!");
     }
 
     // Compute sigmoid parameters using standard form
-    float slope_mid = 0.5f * (top_logit + slope_logit);
-    float mid = 0.5f * (max_logit + bottom_logit);
-    float transition_range = fmaxf(1e-6f, top_logit - slope_logit);
-    float total_range = fmaxf(1e-6f, max_logit - bottom_logit);
-    float k = 1.0f / fmaxf(1e-6f, transition_range / total_range);
+    float slope_mid_i = 0.5f * (float(top_i) + float(slope_i));
+    float height_p = fmaxf(1e-6f, max_p - min_p),
+          slope_p = 10.0f / fmaxf(1e-6f, float(slope_i - top_i)),
+          scale_pow = 1.0f / fmaxf(1e-6f, height);
 
-    float min_val = mid - height * (mid - bottom_logit);
-    float sig_range = fmaxf(1e-6f, height * (max_logit - bottom_logit));
+    // Optimization: pre-allocate target ps to avoid duplicate sigmoid calculations
+    std::vector<float> target_ps(target_length);
 
-    // Optimization: pre-allocate target logits to avoid duplicate sigmoid calculations
-    std::vector<float> target_logits(cur_p->size);
-    float max_exp = logf(std::numeric_limits<float>::max()) / target_length;
-
-    // Pass 2: Compute target logit and sum
+    // Pass 2: Compute lerped target p
     float target_sum = 0.0f;
     for (size_t i = 0; i < target_length; ++i) {
-        float sigmoid_val = 1.0f / (1.0f + expf(-k * (fminf(max_exp, fmaxf(-max_exp, cur_p->data[i].logit - slope_mid)))));
-        target_logits[i] = min_val + sig_range * sigmoid_val;
-        target_sum += target_logits[i];
+        float sigmoid_val = height_p / (1.0f + expf(slope_p * (float(i) - slope_mid_i))),
+              sigmoid_p = powf(min_p + sigmoid_val, scale_pow);
+        target_ps[i] = (1 - strength) * cur_p->data[i].p + strength * sigmoid_p;
+        target_sum += target_ps[i];
     }
 
-    // Pass 3: normalize + lerp + cutoff (using pre-computed values)
-    cumsum = 0.0f;
+    // Pass 3: normalize using pre-computed sum
     for (size_t i = 0; i < target_length; ++i) {
-        float t_norm = target_logits[i] / target_sum;
-
-        // normalizing the target logits gives 0..1 'probability' space
-        cur_p->data[i].p = (1.0f - strength) * cur_p->data[i].p + strength * t_norm;
-        cumsum += cur_p->data[i].p;
-    }
-
-    // Pass 4: renormalize outputs
-    // Preserves probability floor - prevents tail tokens from approaching 0%
-    // The controlled probability floor is a key feature distinguishing sigmoid
-    //   from traditional softmax (e.g. [0.4,0.25,0.2,0.1,0.1] vs [0.6,0.3,0.2,0.0,0.0])
-    for (size_t i = 0; i < target_length; ++i) {
-        cur_p->data[i].p /= cumsum;
+        cur_p->data[i].p = target_ps[i] / target_sum;
     }
 
     // Tokens remain sorted: lerp between two descending sequences preserves order
     cur_p->sorted = true;
     cur_p->size = target_length;
-    
+
     // Set flag indicating probabilities are normalized
     //   to avoid spurious re-softmaxing if avoidable
+    //   this keeps the p-floor > 0 on purpose
     if (probabilities_normalized) {
         *probabilities_normalized = true;
     }
@@ -2212,9 +2208,10 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
     for (size_t i = 0; i < candidates_p->size; ++i) {
         candidates_p->data[i].logit /= temp;
     }
+    sample_softmax(candidates_p);
+
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
     if (smoothing_factor > 0 && candidates_p->size > 1) {
-        sample_softmax(candidates_p);
         float h = candidates_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
         // Apply the modified quadratic transformation using the smoothing_factor and smoothing_curve
         for (size_t i = 0; i < candidates_p->size; ++i) {
@@ -2224,9 +2221,9 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
             candidates_p->data[i].logit = -(k * smoothing_factor * logit_shifted * logit_shifted) + (s * smoothing_factor * logit_shifted * logit_shifted * logit_shifted) + h;
         }
         sample_softmax(candidates_p);
-        if (probabilities_normalized) {
-            *probabilities_normalized = true;
-        }
+    }
+    if (probabilities_normalized) {
+        *probabilities_normalized = true;
     }
 }
 
@@ -5939,6 +5936,11 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     kcpp_data->adaptive_target = inputs.adaptive_target;
     kcpp_data->adaptive_decay = inputs.adaptive_decay;
     kcpp_data->reasoning_budget = inputs.reasoning_budget;
+    kcpp_data->sigmoid_top = inputs.sigmoid_top;
+    kcpp_data->sigmoid_slope = inputs.sigmoid_slope;
+    kcpp_data->sigmoid_bottom = inputs.sigmoid_bottom;
+    kcpp_data->sigmoid_height = inputs.sigmoid_height;
+    kcpp_data->sigmoid_strength = inputs.sigmoid_strength;
 
     adaptive_p_weighted_sum = 0;
     adaptive_p_total_weight = 0;
