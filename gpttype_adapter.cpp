@@ -1122,52 +1122,13 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
 }
 
 // KCPP SAMPLING FUNCTIONS
-void sample_softmax(llama_token_data_array * cur_p, bool do_sort=true) {
-    if(!(cur_p->size > 0))
-    {
-        throw std::runtime_error("No valid candidates during sampling. Current request aborted!");
-    }
-    GGML_ASSERT(cur_p->size > 0);
-    // Sort the logits in descending order
-    if (!cur_p->sorted && do_sort) {
-        std::sort(cur_p->data, cur_p->data + cur_p->size, [](const llama_token_data & a, const llama_token_data & b) {
-            return a.logit > b.logit;
-        });
-        cur_p->sorted = true;
-    }
-    float max_l = cur_p->data[0].logit;
-    if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
-        }
-    }
-    float cum_sum = 0.0f;
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        float p = expf(cur_p->data[i].logit - max_l);
-        cur_p->data[i].p = p;
-        cum_sum += p;
-    }
-
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        cur_p->data[i].p /= cum_sum;
-    }
-}
-
-void sample_top_k(llama_token_data_array * cur_p, int32_t k, bool* probabilities_normalized = nullptr) {
-    // TODO: move bucket sort to separate function so that top_p/tail_free/typical/softmax first is equally fast
-    // if (k >= (int32_t)cur_p->size) {
-    //     return;
-    // }
-
+void sort_top_k(llama_token_data_array * cur_p, int32_t k = -1, bool* probabilities_normalized = nullptr) {
     if (k <= 0) {
         k = cur_p->size;
     }
 
     k = std::max(k, (int) 1); //min keep of 1
     k = std::min(k, (int) cur_p->size);
-
-    if (cur_p->size == k)
-        return;
 
     // Sort scores in descending order
     if (!cur_p->sorted) {
@@ -1241,11 +1202,61 @@ void sample_top_k(llama_token_data_array * cur_p, int32_t k, bool* probabilities
     }
 }
 
-llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng, bool* probabilities_normalized = false)
-{
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(candidates);
+// Default args handles as overloads below. Simpler than variadic args
+void sample_softmax(llama_token_data_array * cur_p, bool do_sort, bool* probabilities_normalized) {
+    if(cur_p->size == 0)
+    {
+        throw std::runtime_error("No valid candidates during sampling. Current request aborted!");
     }
+    GGML_ASSERT(cur_p->size > 0);
+    
+    if (do_sort) {
+        sort_top_k(cur_p, -1, probabilities_normalized);
+    }
+    if (probabilities_normalized && *probabilities_normalized) {
+        return;
+    }
+
+    float max_l = cur_p->data[0].logit;
+    if (!cur_p->sorted) {
+        for (size_t i = 1; i < cur_p->size; ++i) {
+            max_l = std::max(max_l, cur_p->data[i].logit);
+        }
+    }
+    float cum_sum = 0.0f;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        float p = expf(cur_p->data[i].logit - max_l);
+        cur_p->data[i].p = p;
+        cum_sum += p;
+    }
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p /= cum_sum;
+    }
+
+    if (probabilities_normalized) {
+        *probabilities_normalized = true;
+    }
+}
+
+// Function overloads to handle 2-arg cases
+void sample_softmax(llama_token_data_array * cur_p, bool* probabilities_normalized) {
+    sample_softmax(cur_p, true, probabilities_normalized);
+}
+
+void sample_softmax(llama_token_data_array * cur_p, bool do_sort) {
+    sample_softmax(cur_p, do_sort, nullptr);
+}
+
+// Function overload to handle 1-arg case
+void sample_softmax(llama_token_data_array * cur_p) {
+    sample_softmax(cur_p, true, nullptr);
+}
+
+llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng, bool* probabilities_normalized = nullptr)
+{
+    sample_softmax(candidates, probabilities_normalized);
+
     std::vector<float> probs;
     probs.reserve(candidates->size);
     TopPicksData newpick;
@@ -1313,7 +1324,7 @@ llama_token sample_token_mirostat(int n_vocab, llama_token_data_array * candidat
     float epsilon_hat = s_hat - 1;
     float k = powf((epsilon_hat * powf(2, *mu)) / (1 - powf(N, -epsilon_hat)), 1 / s_hat);
     // Sample the next word X using top-k sampling
-    sample_top_k(candidates, int(k));
+    sort_top_k(candidates, int(k));
     llama_token X = sample_token(candidates, rng);    // Compute error as the difference between observed surprise and target surprise value
     size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
         return candidate.id == X;
@@ -1360,9 +1371,7 @@ void sample_top_a(llama_token_data_array * candidates, float a, size_t min_keep,
         return;
     }
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(candidates);
-    }
+    sample_softmax(candidates, probabilities_normalized);
 
     // Compute the cumulative probabilities
     float maxprob = candidates->data[0].p;
@@ -1389,7 +1398,7 @@ void sample_top_a(llama_token_data_array * candidates, float a, size_t min_keep,
     }    
 }
 
-void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float xtc_probability, std::mt19937 & rng, bool* probabilities_normalized = false)
+void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float xtc_probability, std::mt19937 & rng, bool* probabilities_normalized = nullptr)
 {
     if (xtc_threshold > 0.5f || xtc_probability <= 0.0f || candidates->size <= 1) {
         return;
@@ -1402,9 +1411,7 @@ void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float 
         return;
     }
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(candidates);
-    }
+    sample_softmax(candidates, probabilities_normalized);
 
     //calculate how many tokens cross the xtc threshold
     size_t last_idx = candidates->size;
@@ -1431,12 +1438,17 @@ void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float 
                 ::utreplace(tokenizedstr, "\n", "\\n");
                 printf("%s(%s %.02f%%)", i == 0 ? "" : " ", RemoveBell(tokenizedstr).c_str(), 100.f * candidates->data[i].p);
             }
-            candidates->data[i].logit -= 999.0f; //infinity gets wonky results downstream, this hack works well enough
+            candidates->data[i].logit = -INFINITY; // Use -INFINITY as mask for removal
         }
+
+        // remove_if is stable, order is preserved
+        auto last   = std::remove_if(candidates->data, candidates->data + candidates->size,
+                                    [&](auto & tk) { return tk.logit == -INFINITY; });
+        candidates->size = last - candidates->data;
+
         if (debugmode==1 && !is_quiet) {
             printf("]\n");
         }
-        candidates->sorted = false;
 
         if (probabilities_normalized) {
             *probabilities_normalized = false;
@@ -1448,7 +1460,7 @@ void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float 
 
 }
 
-void sample_dry(int n_ctx, int penalty_range, float penalty_multiplier, float penalty_base, int allowed_length, const std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>>& restart_sequences, llama_token_data_array * candidates, bool* probabilities_normalized = false) {
+void sample_dry(int n_ctx, int penalty_range, float penalty_multiplier, float penalty_base, int allowed_length, const std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>>& restart_sequences, llama_token_data_array * candidates, bool* probabilities_normalized = nullptr) {
     if (penalty_multiplier <= 0.0f || penalty_base <= 0.0f) {
         return;
     }
@@ -1662,7 +1674,7 @@ float target,            // desired average probability (0..1), <=0 disables
 float & weighted_sum,    // persistent EMA state
 float & total_weight,    // persistent EMA state
 llama_token_data_array * cur_p,
-bool* probabilities_normalized = false)
+bool* probabilities_normalized = nullptr)
 {
     const float width = 0.3;              // DISTRIBUTION_WIDTH
     const float peak_logit = 5.0;         // PEAK_LOGIT_VALUE
@@ -1676,9 +1688,7 @@ bool* probabilities_normalized = false)
     // higher values favor more probable tokens (more stable and predictable)
     // lower values favor less probable tokens (more creative)
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(cur_p);
-    }
+    sample_softmax(cur_p, probabilities_normalized);
 
     // compute the adapted target probability for the current sampling step
     float computed_target = std::clamp(total_weight == 0.0f ? target : 2.0f * target - (weighted_sum / total_weight),0.0f, 1.0f);
@@ -1692,10 +1702,10 @@ bool* probabilities_normalized = false)
     }
 
     cur_p->sorted = false;
-    sample_softmax(cur_p);
     if (probabilities_normalized) {
-        *probabilities_normalized = true;
+        *probabilities_normalized = false;
     }
+    sample_softmax(cur_p, probabilities_normalized);
 
     //update EMA history AFTER sampling, update_adaptive_p_history(original_prob[idx])
 }
@@ -1804,9 +1814,7 @@ void sample_top_p(llama_token_data_array * cur_p, float p, size_t min_keep, bool
         return;
     }
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(cur_p);
-    }
+    sample_softmax(cur_p, probabilities_normalized);
 
     // Compute the cumulative probabilities
     float cum_sum = 0.0f;
@@ -1830,7 +1838,7 @@ void sample_top_p(llama_token_data_array * cur_p, float p, size_t min_keep, bool
     }
 }
 
-void sample_min_p(llama_token_data_array * cur_p, float p, size_t min_keep, bool* probabilities_normalized = false) {
+void sample_min_p(llama_token_data_array * cur_p, float p, size_t min_keep, bool* probabilities_normalized = nullptr) {
     if (p <= 0.0f || !cur_p->size) {
         return;
     }
@@ -1863,13 +1871,7 @@ void sample_min_p(llama_token_data_array * cur_p, float p, size_t min_keep, bool
 
     // if the cur_p are sorted or the unsorted implementation failed, use this implementation
     if (!min_p_applied) {
-        // Sort the logits in descending order
-        if (!cur_p->sorted) {
-            std::sort(cur_p->data, cur_p->data + cur_p->size, [](const llama_token_data & a, const llama_token_data & b) {
-                return a.logit > b.logit;
-            });
-            cur_p->sorted = true;
-        }
+        sort_top_k(cur_p, -1, probabilities_normalized);
 
         const float min_logit = cur_p->data[0].logit + logf(p); // min logit for p_i >= p * p_max
         size_t i = 1; // first token always matches
@@ -1893,9 +1895,7 @@ void sample_tail_free(llama_token_data_array * cur_p, float z, size_t min_keep, 
         return;
     }
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(cur_p);
-    }
+    sample_softmax(cur_p, probabilities_normalized);
 
     // Compute the first and second derivatives
     std::vector<float> second_derivatives(cur_p->size - 2);
@@ -1938,7 +1938,7 @@ void sample_tail_free(llama_token_data_array * cur_p, float z, size_t min_keep, 
     }
 }
 
-void sampler_typical(llama_token_data_array * cur_p, float p, size_t min_keep, bool* probabilities_normalized = false) {
+void sampler_typical(llama_token_data_array * cur_p, float p, size_t min_keep, bool* probabilities_normalized = nullptr) {
     // Reference implementation:
     // https://github.com/huggingface/transformers/compare/main...cimeister:typical-sampling:typical-pr
     if (p >= 1.0f) {
@@ -1946,9 +1946,7 @@ void sampler_typical(llama_token_data_array * cur_p, float p, size_t min_keep, b
     }
 
     // Compute the softmax of logits and calculate entropy
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(cur_p);
-    }
+    sample_softmax(cur_p, probabilities_normalized);
 
     float entropy = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
@@ -2009,26 +2007,18 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
                           float height, float strength,
                           bool* probabilities_normalized = nullptr) {
     // enforce landmark sorting invariant
-    if (cur_p->size < 3 || strength <= 0.0f) return;
-    if(slope < top || bottom < slope)
+    if (cur_p->size <= 1 || strength <= 0.0f) return;
+    if (slope < top || bottom < slope)
     {
         throw std::runtime_error("Sigmoid sampler thresholds must be ordered top <= slope <= bottom!");
     }
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(cur_p);
-    }
-    else if (!cur_p->sorted) {
-        std::sort(cur_p->data, cur_p->data + cur_p->size, [](const llama_token_data & a, const llama_token_data & b) {
-            return a.logit > b.logit;
-        });
-        cur_p->sorted = true;
-    }
+    sample_softmax(cur_p, probabilities_normalized);
 
     // Pass 1: Find landmarks at cumulative probability thresholds
     size_t top_i = 0,
            target_length = cur_p->size;
-    size_t slope_i = target_length / 2;
+    size_t slope_i = (target_length - 1) / 2;
     float max_p = cur_p->data[top_i].p,
           min_p = cur_p->data[target_length-1].p;
 
@@ -2041,26 +2031,26 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
             top_i = i;
             found_top = true;
         }
-        else if (!found_slope && cumsum >= slope) {
+        if (!found_slope && cumsum >= slope) {
             slope_i = i;
             found_slope = true;
         }
-        else if (cumsum >= bottom) {
+        if (cumsum >= bottom) {
             min_p = cur_p->data[i].p;
             target_length = i+1;
             break;
         }
     }
-    if(target_length < 3 || top_i > slope_i || slope_i > target_length - 1)
+    if(top_i > slope_i || slope_i > target_length - 1)
     {
         throw std::runtime_error("Sigmoid landmarks out of order, this shouldn't happen!");
     }
 
     // Compute sigmoid parameters using standard form
     float slope_mid_i = 0.5f * (float(top_i) + float(slope_i));
-    float height_p = fmaxf(1e-6f, max_p - min_p),
-          slope_p = 10.0f / fmaxf(1e-6f, float(slope_i - top_i)),
-          scale_pow = 1.0f / fmaxf(1e-6f, height);
+    float lower_p = min_p + (1 - height) * (max_p - min_p),
+          height_p = height * (max_p - min_p),
+          slope_p = 10.0f / fmaxf(1e-6f, float(slope_i - top_i));
 
     // Optimization: pre-allocate target ps to avoid duplicate sigmoid calculations
     std::vector<float> target_ps(target_length);
@@ -2068,9 +2058,8 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     // Pass 2: Compute lerped target p
     float target_sum = 0.0f;
     for (size_t i = 0; i < target_length; ++i) {
-        float sigmoid_val = height_p / (1.0f + expf(slope_p * (float(i) - slope_mid_i))),
-              sigmoid_p = powf(min_p + sigmoid_val, scale_pow);
-        target_ps[i] = (1 - strength) * cur_p->data[i].p + strength * sigmoid_p;
+        float sigmoid_val = lower_p + height_p / (1.0f + expf(slope_p * (float(i) - slope_mid_i)));
+        target_ps[i] = (1 - strength) * cur_p->data[i].p + strength * sigmoid_val;
         target_sum += target_ps[i];
     }
 
@@ -2091,7 +2080,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     }
 }
 
-void sample_top_n_sigma(llama_token_data_array * cur_p, float nsigma, bool* probabilities_normalized = false) {
+void sample_top_n_sigma(llama_token_data_array * cur_p, float nsigma, bool* probabilities_normalized = nullptr) {
     if (nsigma <= 0.0f || cur_p->size <= 1) {
         return;
     }
@@ -2118,13 +2107,13 @@ void sample_top_n_sigma(llama_token_data_array * cur_p, float nsigma, bool* prob
                                  [&](auto & tk) { return tk.logit < nsigmax - (nsigma * nsigstd); });
     cur_p->size = last - cur_p->data;
 
-    sample_softmax(cur_p);
     if (probabilities_normalized) {
-        *probabilities_normalized = true;
+        *probabilities_normalized = false;
     }
+    sample_softmax(cur_p, probabilities_normalized);
 }
 
-void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_temp, float exponent_val, float smoothing_factor, float smoothing_curve, bool* probabilities_normalized = false) {
+void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_temp, float exponent_val, float smoothing_factor, float smoothing_curve, bool* probabilities_normalized = nullptr) {
     // no need to do anything if there is only one (or zero) candidates
     if (cur_p->size <= 1) {
         return;
@@ -2133,9 +2122,7 @@ void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_te
     // Calculate maximum possible entropy
     float max_entropy = -logf(1.0f / cur_p->size);
 
-    if (probabilities_normalized && !(*probabilities_normalized)) {
-        sample_softmax(cur_p);
-    }
+    sample_softmax(cur_p, false, probabilities_normalized);
 
     // Calculate entropy of the softmax probabilities
     float entropy = 0.0f;
@@ -2177,9 +2164,12 @@ void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_te
 
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
     if (smoothing_factor > 0 && cur_p->size > 1) {
-        if (probabilities_normalized && !(*probabilities_normalized)) {
-            sample_softmax(cur_p);
+        cur_p->sorted = false;
+        if (probabilities_normalized) {
+            *probabilities_normalized = false;
         }
+        sample_softmax(cur_p, probabilities_normalized);
+
         float h = cur_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
         // Apply the modified quadratic transformation using the smoothing_factor and smoothing_curve
         for (size_t i = 0; i < cur_p->size; ++i) {
@@ -2188,27 +2178,27 @@ void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_te
             float s = (smoothing_curve - 1) / 2;
             cur_p->data[i].logit = -(k * smoothing_factor * logit_shifted * logit_shifted) + (s * smoothing_factor * logit_shifted * logit_shifted * logit_shifted) + h;
         }
-        sample_softmax(cur_p);
 
         if (probabilities_normalized) {
-            *probabilities_normalized = true;
+            *probabilities_normalized = false;
         }
+        sample_softmax(cur_p, false, probabilities_normalized);
     }
 
 }
 
-void sample_temperature(llama_token_data_array * candidates_p, float temp, float smoothing_factor, float smoothing_curve, bool* probabilities_normalized = false)
+void sample_temperature(llama_token_data_array * candidates_p, float temp, float smoothing_factor, float smoothing_curve, bool* probabilities_normalized = nullptr)
 {
     if (temp <= 0)
     {
-        sample_top_k(candidates_p, 1);  //only want first candidate
+        sort_top_k(candidates_p, 1, probabilities_normalized);  //only want first candidate
         return;
     }
 
     for (size_t i = 0; i < candidates_p->size; ++i) {
         candidates_p->data[i].logit /= temp;
     }
-    sample_softmax(candidates_p);
+    sample_softmax(candidates_p, probabilities_normalized);
 
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
     if (smoothing_factor > 0 && candidates_p->size > 1) {
@@ -2220,7 +2210,10 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
             float s = (smoothing_curve - 1) / 2;
             candidates_p->data[i].logit = -(k * smoothing_factor * logit_shifted * logit_shifted) + (s * smoothing_factor * logit_shifted * logit_shifted * logit_shifted) + h;
         }
-        sample_softmax(candidates_p);
+        if (probabilities_normalized) {
+            *probabilities_normalized = false;
+        }
+        sample_softmax(candidates_p, probabilities_normalized);
     }
     if (probabilities_normalized) {
         *probabilities_normalized = true;
@@ -2298,7 +2291,7 @@ static llama_grammar_candidates kcpp_llama_grammar_reject_candidates(
     return rejects;
 }
 
-void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_array * candidates, const struct llama_grammar * grammar, bool* probabilities_normalized = false) {
+void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_array * candidates, const struct llama_grammar * grammar, bool* probabilities_normalized = nullptr) {
 
     const int64_t t_start_sample_us = ggml_time_us();
 
@@ -2309,10 +2302,11 @@ void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_ar
             break;
         }
     }
+
+    candidates->sorted = false;
     if (probabilities_normalized) {
         *probabilities_normalized = false;
     }
-    candidates->sorted = false;
 
     const std::vector<llama_token> eog_tokens = GetEogIDs(file_format,n_vocab);
 
@@ -2462,7 +2456,7 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
             printf("\n(Reasoning Budget of %d tokens exceeded! Finishing thinking...)\n", kcpp_data->reasoning_budget);
         }
         candidates[newid].logit += 99999;
-        sample_top_k(&candidates_p, 1);
+        sort_top_k(&candidates_p, 1, &probabilities_normalized);
         id = sample_token(&candidates_p, rng);
         return id;
     }
@@ -2474,7 +2468,7 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
     bool use_grammar = grammar != nullptr;
     std::vector<llama_token_data> precache = (use_grammar ? std::vector<llama_token_data>(candidates) : std::vector<llama_token_data>(0));
 
-    sample_top_k(&candidates_p, 3000, &probabilities_normalized);
+    sort_top_k(&candidates_p, 3000, &probabilities_normalized);
 
     if (use_grammar) {
         sample_grammar(file_format, n_vocab, &candidates_p, grammar, &probabilities_normalized);
@@ -2482,7 +2476,7 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
         if (candidates_p.size <= 0) {
             candidates_p = { precache.data(), precache.size(), false };
             sample_grammar(file_format, n_vocab, &candidates_p, grammar, &probabilities_normalized);
-            sample_top_k(&candidates_p, 3000, &probabilities_normalized);
+            sort_top_k(&candidates_p, 3000, &probabilities_normalized);
         }
     }
 
@@ -2508,7 +2502,7 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
             switch (sampler_order[i])
             {
                 case KCPP_SAMPLER_TOP_K:
-                    sample_top_k(&candidates_p, top_k, &probabilities_normalized);
+                    sort_top_k(&candidates_p, top_k, &probabilities_normalized);
                     break;
                 case KCPP_SAMPLER_TOP_A:
                     sample_top_a(&candidates_p, top_a, 1, &probabilities_normalized);
