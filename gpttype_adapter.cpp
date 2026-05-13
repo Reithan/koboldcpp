@@ -1132,7 +1132,7 @@ void sort_top_k(llama_token_data_array * cur_p, int32_t k = -1, bool* probabilit
 
     // Sort scores in descending order
     if (!cur_p->sorted) {
-        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+            auto comp = [](const llama_token_data & a, const llama_token_data & b) {
             return a.logit > b.logit;
         };
         if (k <= 128) {
@@ -1196,10 +1196,10 @@ void sort_top_k(llama_token_data_array * cur_p, int32_t k = -1, bool* probabilit
         }
         cur_p->sorted = true;
     }
-    cur_p->size = k;
-    if (probabilities_normalized) {
+    if (cur_p->size != k && probabilities_normalized) {
         *probabilities_normalized = false;
     }
+    cur_p->size = k;
 }
 
 // Default args handles as overloads below. Simpler than variadic args
@@ -1210,19 +1210,20 @@ void sample_softmax(llama_token_data_array * cur_p, bool do_sort, bool* probabil
     }
     GGML_ASSERT(cur_p->size > 0);
     
+    float max_l = 0.f;
     if (do_sort) {
         sort_top_k(cur_p, -1, probabilities_normalized);
+        max_l = cur_p->data[0].logit;
+    } else if (!cur_p->sorted) {
+        for (size_t i = 1; i < cur_p->size; ++i) {
+            max_l = fmaxf(max_l, cur_p->data[i].logit);
+        }
     }
+
     if (probabilities_normalized && *probabilities_normalized) {
         return;
     }
 
-    float max_l = cur_p->data[0].logit;
-    if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
-        }
-    }
     float cum_sum = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
         float p = expf(cur_p->data[i].logit - max_l);
@@ -1279,22 +1280,22 @@ llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng
     newpick.logprobs.reserve(std::min((size_t) logprobs_max, candidates->size));
     newpick.p.reserve(std::min((size_t) logprobs_max, candidates->size));
 
+    auto logProb = [&](const float prob) -> float {
+        return fminf(999.0f, fmaxf(-999.0f,
+            logf(
+                fmaxf(0.0001f, prob)
+            )
+        ));
+    };
+
     newpick.selected_token = FileFormatTokenizeID(candidates->data[idx].id, file_format, true);
-    float rp1 = (candidates->data[idx].p<=0.0001?0.0001f:candidates->data[idx].p);
-    float sprob = logf(rp1);
-    sprob = (sprob > 999.0f?999.0f:sprob);
-    sprob = (sprob < -999.0f?-999.0f:sprob);
-    newpick.selected_logprob = sprob;
+    newpick.selected_logprob = logProb(candidates->data[idx].p);
     newpick.selected_probability = candidates->data[idx].p;
     newpick.selected_tokenid = candidates->data[idx].id;
     for (size_t i = 0; (i < candidates->size && i<logprobs_max); ++i)
     {
         newpick.tokens.push_back(FileFormatTokenizeID(candidates->data[i].id, file_format, true));
-        float rp2 = (candidates->data[i].p<=0.0001?0.0001f:candidates->data[i].p);
-        float prob = logf(rp2);
-        prob = (prob > 999.0f?999.0f:prob);
-        prob = (prob < -999.0f?-999.0f:prob);
-        newpick.logprobs.push_back(prob);
+        newpick.logprobs.push_back(logProb(candidates->data[i].p));
         newpick.p.push_back(candidates->data[i].p);
         newpick.tokenid.push_back(candidates->data[i].id);
     }
@@ -2016,9 +2017,7 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     sample_softmax(cur_p, probabilities_normalized);
 
     // Pass 1: Find landmarks at cumulative probability thresholds
-    size_t top_i = 0,
-           target_length = cur_p->size;
-    size_t slope_i = (target_length - 1) / 2;
+    size_t top_i = 0, slope_i = 0, target_length = cur_p->size;
     float max_p = cur_p->data[top_i].p,
           min_p = cur_p->data[target_length-1].p;
 
@@ -2040,6 +2039,10 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
             target_length = i+1;
             break;
         }
+    }
+    if(!found_top || !found_slope)
+    {
+        throw std::runtime_error("Sigmoid landmarks not found, this shouldn't happen!");
     }
     if(top_i > slope_i || slope_i > target_length - 1)
     {
@@ -2069,7 +2072,6 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     }
 
     // Tokens remain sorted: lerp between two descending sequences preserves order
-    cur_p->sorted = true;
     cur_p->size = target_length;
 
     // Set flag indicating probabilities are normalized
@@ -2138,36 +2140,19 @@ void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_te
 
     // Map the normalized entropy to the desired temperature range using the power function
     float dyn_temp = min_temp + (max_temp - min_temp) * powf(normalized_entropy, exponent_val);
+    dyn_temp = fmaxf(0.0001f, dyn_temp);
 
     // Apply the dynamically calculated temperature scaling
     for (size_t i = 0; i < cur_p->size; ++i) {
         cur_p->data[i].logit /= dyn_temp;
     }
 
-    // Re-compute softmax probabilities after scaling logits with dynamic temperature
-    const double max_l_double = cur_p->data[0].logit;
-
-    double cum_sum_double = 0.0;
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        double p = exp(cur_p->data[i].logit - max_l_double);
-        cur_p->data[i].p = p; // Store the scaled probability
-        cum_sum_double += p;
-    }
-
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        cur_p->data[i].p /= cum_sum_double; // Re-normalize the probabilities
-    }
-
     if (probabilities_normalized) {
-        *probabilities_normalized = true;
+        *probabilities_normalized = false;
     }
 
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
     if (smoothing_factor > 0 && cur_p->size > 1) {
-        cur_p->sorted = false;
-        if (probabilities_normalized) {
-            *probabilities_normalized = false;
-        }
         sample_softmax(cur_p, probabilities_normalized);
 
         float h = cur_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
@@ -2182,9 +2167,9 @@ void sample_entropy(llama_token_data_array * cur_p, float min_temp, float max_te
         if (probabilities_normalized) {
             *probabilities_normalized = false;
         }
-        sample_softmax(cur_p, false, probabilities_normalized);
     }
 
+    sample_softmax(cur_p, false, probabilities_normalized);
 }
 
 void sample_temperature(llama_token_data_array * candidates_p, float temp, float smoothing_factor, float smoothing_curve, bool* probabilities_normalized = nullptr)
@@ -2198,10 +2183,14 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
     for (size_t i = 0; i < candidates_p->size; ++i) {
         candidates_p->data[i].logit /= temp;
     }
-    sample_softmax(candidates_p, probabilities_normalized);
+    
+    if (probabilities_normalized) {
+        probabilities_normalized = false;
+    }
 
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
     if (smoothing_factor > 0 && candidates_p->size > 1) {
+        sample_softmax(candidates_p, probabilities_normalized);
         float h = candidates_p->data[0].logit; // Find the maximum logit for h to be added after the transformation
         // Apply the modified quadratic transformation using the smoothing_factor and smoothing_curve
         for (size_t i = 0; i < candidates_p->size; ++i) {
@@ -2210,14 +2199,13 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
             float s = (smoothing_curve - 1) / 2;
             candidates_p->data[i].logit = -(k * smoothing_factor * logit_shifted * logit_shifted) + (s * smoothing_factor * logit_shifted * logit_shifted * logit_shifted) + h;
         }
+
         if (probabilities_normalized) {
             *probabilities_normalized = false;
         }
-        sample_softmax(candidates_p, probabilities_normalized);
     }
-    if (probabilities_normalized) {
-        *probabilities_normalized = true;
-    }
+
+    sample_softmax(candidates_p, probabilities_normalized);
 }
 
 static std::pair<std::vector<uint32_t>, llama_partial_utf8> kcpp_decode_utf8(
@@ -2422,11 +2410,28 @@ static int apply_reasoning_budget(int id, const std::vector<int> & start_think, 
     return id;
 }
 
-int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float rep_pen_slope, float presence_penalty, float top_k, float top_a, float top_p, float min_p, float typical_p, float tfs, float nsigma, float temp, std::mt19937 & rng,
-int mirostat, float mirostat_tau, float mirostat_eta, float dry_multiplier, float dry_base, int dry_allowed_length, int dry_penalty_last_n, float xtc_threshold, float xtc_probability,
-float sigmoid_top, float sigmoid_slope, float sigmoid_bottom, float sigmoid_height, float sigmoid_strength,
-const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dynatemp_range, float dynatemp_exponent, float smoothing_factor, float smoothing_curve, float adaptive_target,
-const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq, std::vector<int> & think_end_phrase_toks, int reasoning_budget)
+int SampleLogits(
+        const float * logits, int n_ctx, int n_vocab,
+        int rep_pen_range, float rep_pen, float rep_pen_slope, float presence_penalty,
+        float top_k,
+        float top_a,
+        float top_p,
+        float min_p,
+        float typical_p,
+        float tfs,
+        float nsigma,
+        float temp,
+        std::mt19937 & rng,
+        int mirostat, float mirostat_tau, float mirostat_eta,
+        float dry_multiplier, float dry_base, int dry_allowed_length, int dry_penalty_last_n,
+        float xtc_threshold, float xtc_probability,
+        float sigmoid_top, float sigmoid_slope, float sigmoid_bottom, float sigmoid_height, float sigmoid_strength,
+        const std::vector<samplers> & sampler_order,
+        llama_grammar * grammar,
+        float dynatemp_range, float dynatemp_exponent, float smoothing_factor, float smoothing_curve,
+        float adaptive_target,
+        const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq, std::vector<int> & think_end_phrase_toks, int reasoning_budget
+    )
 {
     // printf("SampleLogits called with: n_ctx=%d, n_vocab=%d, rep_pen_range=%d, rep_pen=%f, rep_pen_slope=%f, presence_penalty=%f, top_k=%f, top_a=%f, top_p=%f, min_p=%f, typical_p=%f, tfs=%f, nsigma=%f, temp=%f, mirostat=%d, mirostat_tau=%f, mirostat_eta=%f, dry_multiplier=%f, dry_base=%f, dry_allowed_length=%d, dry_penalty_last_n=%d, xtc_threshold=%f, xtc_probability=%f, sampler_order_size=%zu, dynatemp_range=%f, dynatemp_exponent=%f, smoothing_factor=%f\n",
     // n_ctx, n_vocab, rep_pen_range, rep_pen, rep_pen_slope, presence_penalty, top_k, top_a, top_p, min_p, typical_p, tfs, nsigma, temp, mirostat, mirostat_tau, mirostat_eta, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, xtc_threshold, xtc_probability, sampler_order.size(), dynatemp_range, dynatemp_exponent, smoothing_factor);
@@ -2526,9 +2531,9 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
                         float dynatemp_min = temp - dynatemp_range;
                         float dynatemp_max = temp + dynatemp_range;
                         //do not allow negative values
-                        dynatemp_min = dynatemp_min<0?0:dynatemp_min;
-                        dynatemp_max = dynatemp_max<0?0:dynatemp_max;
-                        dynatemp_exponent = dynatemp_exponent<0?0:dynatemp_exponent;
+                        dynatemp_min = fmaxf(0.f, dynatemp_min);
+                        dynatemp_max = fmaxf(0.f, dynatemp_max);
+                        dynatemp_exponent = fmaxf(0.f, dynatemp_exponent);
                         sample_entropy(&candidates_p, dynatemp_min, dynatemp_max, dynatemp_exponent, smoothing_factor, smoothing_curve, &probabilities_normalized);
                     }
                     else
