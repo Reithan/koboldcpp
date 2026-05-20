@@ -1132,7 +1132,7 @@ void sort_top_k(llama_token_data_array * cur_p, int32_t k = -1, bool* probabilit
 
     // Sort scores in descending order
     if (!cur_p->sorted) {
-            auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
             return a.logit > b.logit;
         };
         if (k <= 128) {
@@ -1443,8 +1443,7 @@ void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float 
         }
 
         // remove_if is stable, order is preserved
-        auto last   = std::remove_if(candidates->data, candidates->data + candidates->size,
-                                    [&](auto & tk) { return tk.logit == -INFINITY; });
+        auto last = std::remove_if(candidates->data, candidates->data + candidates->size, [&](auto & tk) { return tk.logit == -INFINITY; });
         candidates->size = last - candidates->data;
 
         if (debugmode==1 && !is_quiet) {
