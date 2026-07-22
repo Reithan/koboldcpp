@@ -2016,26 +2016,31 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     sample_softmax(cur_p, probabilities_normalized);
 
     // Pass 1: Find landmarks at cumulative probability thresholds
-    size_t top_i = 0, slope_i = 0, target_length = cur_p->size;
+    size_t top_i = 0, slope_i = 0, bottom_i = cur_p->size;
+    float top_x = 0.0f, slope_x = 0.0f;
     float max_p = cur_p->data[top_i].p,
-          min_p = cur_p->data[target_length-1].p;
+          min_p = cur_p->data[bottom_i-1].p;
 
-    float cumsum = 0.0f;
+    float cumsum = 0.0f, prev = 0.0f, diff = 0.0f;
     bool found_top = false, found_slope = false;
 
     for (size_t i = 0; i < cur_p->size; ++i) {
-        cumsum += cur_p->data[i].p;
+        prev = cumsum;
+        diff = cur_p->data[i].p;
+        cumsum += diff;
         if (!found_top && cumsum >= top) {
             top_i = i;
+            top_x = i + (top - prev) / diff;
             found_top = true;
         }
         if (!found_slope && cumsum >= slope) {
             slope_i = i;
+            slope_x = i + (slope - prev) / diff;
             found_slope = true;
         }
         if (cumsum >= bottom) {
             min_p = cur_p->data[i].p;
-            target_length = i+1;
+            bottom_i = i+1;
             break;
         }
     }
@@ -2043,35 +2048,35 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
     {
         throw std::runtime_error("Sigmoid landmarks not found, this shouldn't happen!");
     }
-    if(top_i > slope_i || slope_i > target_length - 1)
+    if(top_i > slope_i || slope_i > bottom_i - 1)
     {
         throw std::runtime_error("Sigmoid landmarks out of order, this shouldn't happen!");
     }
 
     // Compute sigmoid parameters using standard form
-    float slope_mid_i = 0.5f * (float(top_i) + float(slope_i));
+    float slope_mid_x = 0.5f * (top_x + slope_x);
     float lower_p = min_p + (1 - height) * (max_p - min_p),
           height_p = height * (max_p - min_p),
-          slope_p = 10.0f / fmaxf(1e-6f, float(slope_i - top_i));
+          slope_p = 10.0f / fmaxf(1e-6f, slope_x - top_x);
 
     // Optimization: pre-allocate target ps to avoid duplicate sigmoid calculations
-    std::vector<float> target_ps(target_length);
+    std::vector<float> target_ps(bottom_i);
 
     // Pass 2: Compute lerped target p
     float target_sum = 0.0f;
-    for (size_t i = 0; i < target_length; ++i) {
-        float sigmoid_val = lower_p + height_p / (1.0f + expf(slope_p * (float(i) - slope_mid_i)));
+    for (size_t i = 0; i < bottom_i; ++i) {
+        float sigmoid_val = lower_p + height_p / (1.0f + expf(slope_p * (float(i) - slope_mid_x)));
         target_ps[i] = (1 - strength) * cur_p->data[i].p + strength * sigmoid_val;
         target_sum += target_ps[i];
     }
 
     // Pass 3: normalize using pre-computed sum
-    for (size_t i = 0; i < target_length; ++i) {
+    for (size_t i = 0; i < bottom_i; ++i) {
         cur_p->data[i].p = target_ps[i] / target_sum;
     }
 
     // Tokens remain sorted: lerp between two descending sequences preserves order
-    cur_p->size = target_length;
+    cur_p->size = bottom_i;
 
     // Set flag indicating probabilities are normalized
     //   to avoid spurious re-softmaxing if avoidable
