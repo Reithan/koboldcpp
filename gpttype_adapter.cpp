@@ -1258,10 +1258,6 @@ llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng
 {
     sample_softmax(candidates, probabilities_normalized);
 
-    std::vector<float> probs;
-    probs.reserve(candidates->size);
-    TopPicksData newpick;
-
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float roll = dist(rng);
     int idx = (int)candidates->size - 1;
@@ -2447,7 +2443,6 @@ int SampleLogits(
     for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
         candidates[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
     }
-    int id = 0;
 
     for(int i=0;i<logit_biases.size();++i)
     {
