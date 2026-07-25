@@ -1210,7 +1210,7 @@ void sample_softmax(llama_token_data_array * cur_p, bool do_sort, bool* probabil
     }
     GGML_ASSERT(cur_p->size > 0);
     
-    float max_l = 0.f;
+    float max_l = cur_p->data[0].logit;
     if (do_sort) {
         sort_top_k(cur_p, -1, probabilities_normalized);
         max_l = cur_p->data[0].logit;
