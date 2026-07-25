@@ -2185,7 +2185,7 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
     }
     
     if (probabilities_normalized) {
-        probabilities_normalized = false;
+        *probabilities_normalized = false;
     }
 
     // Only apply smoothing if smoothing_factor is > 0. Do not change base implementation otherwise.
