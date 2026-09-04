@@ -121,6 +121,8 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    struct llama_sampler * top_k_cull = nullptr; // pre-cull sampler for grammar paths
+
     void reset() {
         prev.clear();
 
@@ -425,14 +427,17 @@ struct common_sampler * common_sampler_init(
     }
 
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params     = */ params,
+        /* .grmr       = */ grmr,
+        /* .rbudget    = */ rbudget,
+        /* .chain      = */ chain,
+        /* .prev       = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur        = */ {},
+        /* .cur_p      = */ {},
+        /* .top_k_cull = */ nullptr,
     };
+
+    result->top_k_cull = llama_sampler_init_top_k(params.top_k > 0 ? std::max(3000, params.top_k) : 3000);
 
     return result;
 }
@@ -445,6 +450,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
+    llama_sampler_free(gsmpl->top_k_cull);
 
     delete gsmpl;
 }
@@ -508,13 +514,14 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params     = */ gsmpl->params,
+        /* .grmr       = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget    = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain      = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev       = */ gsmpl->prev,
+        /* .cur        = */ gsmpl->cur,
+        /* .cur_p      = */ gsmpl->cur_p,
+        /* .top_k_cull = */ llama_sampler_clone(gsmpl->top_k_cull),
     };
 }
 
@@ -526,9 +533,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     GGML_ASSERT((src->grmr == nullptr) == (dst->grmr == nullptr));
     GGML_ASSERT((src->rbudget == nullptr) == (dst->rbudget == nullptr));
 
-    llama_sampler_copy(src->grmr,    dst->grmr);
-    llama_sampler_copy(src->rbudget, dst->rbudget);
-    llama_sampler_copy(src->chain,   dst->chain);
+    llama_sampler_copy(src->grmr,       dst->grmr);
+    llama_sampler_copy(src->rbudget,    dst->rbudget);
+    llama_sampler_copy(src->chain,      dst->chain);
+    llama_sampler_copy(src->top_k_cull, dst->top_k_cull);
 
     dst->params     = src->params;
     dst->prev       = src->prev;
@@ -591,6 +599,17 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// Works before and after grammar compaction PR merges:
+// Before compaction: size stays full-vocab; test logit != -INFINITY.
+// After compaction: size is reduced; test size > 0.
+static bool has_valid_candidate(const llama_token_data_array * cur_p) {
+    if (cur_p->size == 0) { return false; }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (cur_p->data[i].logit != -INFINITY) { return true; }
+    }
+    return false;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -631,8 +650,25 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
+    const bool has_positive_bias = std::any_of(
+        gsmpl->params.logit_bias.begin(), gsmpl->params.logit_bias.end(),
+        [](const llama_logit_bias & lb) { return lb.bias > 0.0f; });
+
     if (grammar_first && grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
+        const bool skip_precull = has_positive_bias || gsmpl->params.grammar_lazy
+                                  || gsmpl->params.top_k <= 0;
+        if (!skip_precull) {
+            llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
+            llama_sampler_apply(grmr, &cur_p);
+            if (!has_valid_candidate(&cur_p)) {
+                gsmpl->set_logits(ctx, idx);
+                llama_sampler_apply(rbudget, &cur_p);
+                llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
+                llama_sampler_apply(grmr, &cur_p);
+            }
+        } else {
+            llama_sampler_apply(grmr, &cur_p);
+        }
     }
 
     llama_sampler_apply(chain, &cur_p);
@@ -660,10 +696,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
 
-    llama_sampler_apply(rbudget,  &cur_p);
+    llama_sampler_apply(rbudget, &cur_p);
 
     if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
+        if (!has_positive_bias && gsmpl->params.top_k > 0) {
+            llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
+            llama_sampler_apply(grmr, &cur_p);
+            if (!has_valid_candidate(&cur_p)) {
+                gsmpl->set_logits(ctx, idx);
+                llama_sampler_apply(rbudget, &cur_p);
+                llama_sampler_apply(grmr, &cur_p);
+            }
+        } else {
+            llama_sampler_apply(grmr, &cur_p);
+        }
     }
 
     llama_sampler_apply(chain, &cur_p);
