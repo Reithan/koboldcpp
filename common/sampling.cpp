@@ -661,10 +661,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
             llama_sampler_apply(grmr, &cur_p);
             if (!has_valid_candidate(&cur_p)) {
+                // Valid token was outside top-k: re-fetch and apply grammar to full vocab,
+                // then cull to top-k from the grammar-valid set.
                 gsmpl->set_logits(ctx, idx);
                 llama_sampler_apply(rbudget, &cur_p);
-                llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
                 llama_sampler_apply(grmr, &cur_p);
+                llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
             }
         } else {
             llama_sampler_apply(grmr, &cur_p);
