@@ -655,8 +655,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         [](const llama_logit_bias & lb) { return lb.bias > 0.0f; });
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
-        const bool skip_precull = has_positive_bias || gsmpl->params.grammar_lazy
-                                  || gsmpl->params.top_k <= 0;
+        const bool skip_precull = has_positive_bias || gsmpl->params.top_k <= 0;
         if (!skip_precull) {
             llama_sampler_apply(gsmpl->top_k_cull, &cur_p);
             llama_sampler_apply(grmr, &cur_p);
