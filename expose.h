@@ -3,6 +3,7 @@
 
 const int tensor_split_max = 16;
 const int logprobs_max = 10;
+const int raw_logprobs_max = 3000;
 const int overridekv_max = 16;
 
 // match kobold's sampler list and order
@@ -152,6 +153,7 @@ struct generation_inputs
     const float sigmoid_bottom = 0.95f;
     const float sigmoid_height = 1.0f;
     const float sigmoid_strength = 0.0f;
+    const int raw_logprobs = 0; //if >0, capture raw pre-sampler top-N probabilities per generated token
 };
 struct generation_outputs
 {
@@ -181,6 +183,17 @@ struct logprob_item {
     const char * tokens[logprobs_max];
     int32_t token_ids[logprobs_max];
     float * logprobs = nullptr;
+};
+struct raw_logprob_item {
+    int count = 0;
+    const int32_t * token_ids = nullptr;
+    const char ** tokens = nullptr;
+    const float * logprobs = nullptr;
+    const float * probs = nullptr;
+};
+struct last_raw_logprobs_outputs {
+    int count = 0;
+    raw_logprob_item * items = nullptr;
 };
 struct last_logprobs_outputs {
     int count = 0;

@@ -429,6 +429,35 @@ extern "C"
         return output;
     }
 
+    static std::vector<TopPicksData> last_raw_toppicks;
+    static std::vector<std::vector<const char *>> last_raw_token_ptrs;
+    static std::vector<raw_logprob_item> last_raw_items;
+    last_raw_logprobs_outputs last_raw_logprobs()
+    {
+        last_raw_logprobs_outputs output;
+        last_raw_items.clear();
+        last_raw_token_ptrs.clear();
+        last_raw_toppicks = gpttype_get_top_picks_data(); //copy top picks
+        last_raw_token_ptrs.resize(last_raw_toppicks.size());
+        for(size_t i=0;i<last_raw_toppicks.size();++i)
+        {
+            raw_logprob_item itm;
+            itm.count = last_raw_toppicks[i].raw_tokenid.size();
+            for(auto & t : last_raw_toppicks[i].raw_tokens)
+            {
+                last_raw_token_ptrs[i].push_back(t.c_str());
+            }
+            itm.token_ids = last_raw_toppicks[i].raw_tokenid.data();
+            itm.tokens = last_raw_token_ptrs[i].data();
+            itm.logprobs = last_raw_toppicks[i].raw_logprobs.data();
+            itm.probs = last_raw_toppicks[i].raw_p.data();
+            last_raw_items.push_back(itm);
+        }
+        output.count = last_raw_items.size();
+        output.items = last_raw_items.data();
+        return output;
+    }
+
     size_t calc_new_state_kv() // returns how much memory a new savestate will cost
     {
         return gpttype_calc_new_state_kv();
