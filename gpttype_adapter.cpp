@@ -2066,9 +2066,14 @@ void sample_sigmoid_shape(llama_token_data_array * cur_p,
         target_sum += target_ps[i];
     }
 
-    // Pass 3: normalize using pre-computed sum
+    // Pass 3: normalize using pre-computed sum, and write the reshaped
+    //   probabilities back into the logits so that any later sampler which
+    //   re-softmaxes from logits (temperature, dynatemp, etc.) operates on
+    //   the sigmoid-shaped distribution instead of silently discarding it.
     for (size_t i = 0; i < bottom_i; ++i) {
-        cur_p->data[i].p = target_ps[i] / target_sum;
+        const float p = target_ps[i] / target_sum;
+        cur_p->data[i].p = p;
+        cur_p->data[i].logit = p > 0.0f ? logf(p) : -INFINITY;
     }
 
     // Tokens remain sorted: lerp between two descending sequences preserves order
