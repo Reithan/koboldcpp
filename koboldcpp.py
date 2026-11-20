@@ -51,6 +51,7 @@ audio_max = 16
 bias_min_value = -100.0
 bias_max_value = 100.0
 logprobs_max = 10
+raw_logprobs_max = 3000
 default_draft_amount = 4
 default_ttsmaxlen = 4096
 default_embeddingsmaxctx = 4096
@@ -248,6 +249,15 @@ class logprob_item(ctypes.Structure):
                 ("tokens", ctypes.c_char_p * logprobs_max),
                 ("token_ids", ctypes.c_int32 * logprobs_max),
                 ("logprobs", ctypes.POINTER(ctypes.c_float))]
+class raw_logprob_item(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_int),
+                ("token_ids", ctypes.POINTER(ctypes.c_int32)),
+                ("tokens", ctypes.POINTER(ctypes.c_char_p)),
+                ("logprobs", ctypes.POINTER(ctypes.c_float)),
+                ("probs", ctypes.POINTER(ctypes.c_float))]
+class last_raw_logprobs_outputs(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_int),
+                ("items", ctypes.POINTER(raw_logprob_item))]
 class last_logprobs_outputs(ctypes.Structure):
     _fields_ = [("count", ctypes.c_int),
                 ("logprob_items", ctypes.POINTER(logprob_item))]
@@ -372,7 +382,8 @@ class generation_inputs(ctypes.Structure):
                 ("sigmoid_slope", ctypes.c_float),
                 ("sigmoid_bottom", ctypes.c_float),
                 ("sigmoid_height", ctypes.c_float),
-                ("sigmoid_strength", ctypes.c_float)]
+                ("sigmoid_strength", ctypes.c_float),
+                ("raw_logprobs", ctypes.c_int)]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -1018,6 +1029,7 @@ def init_library():
     handle.music_generate.argtypes = [music_generation_inputs]
     handle.music_generate.restype = music_generation_outputs
     handle.last_logprobs.restype = last_logprobs_outputs
+    handle.last_raw_logprobs.restype = last_raw_logprobs_outputs
     handle.detokenize.argtypes = [detokenize_inputs]
     handle.detokenize.restype = ctypes.c_char_p
     handle.launch_rpc_server.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
@@ -2126,6 +2138,9 @@ def generate(genparams, stream_flag=False):
     sigmoid_height = tryparsefloat(genparams.get('sigmoid_height', 1.0), 1.0)
     sigmoid_strength = tryparsefloat(genparams.get('sigmoid_strength', 0.0), 0.0)
     nsigma = tryparsefloat(genparams.get('nsigma', 0.0),0.0)
+    raw_logprobs = max(0, min(tryparseint(genparams.get('raw_logprobs', 0), 0), raw_logprobs_max))
+    if raw_logprobs > 0:
+        genparams['logprobs'] = True # raw capture rides on the logprobs response path
     rep_pen = tryparsefloat(genparams.get('rep_pen', adapter_obj.get("rep_pen", 1.0)),1.0)
     rep_pen_range = tryparseint(genparams.get('rep_pen_range', 320),320)
     rep_pen_slope = tryparsefloat(genparams.get('rep_pen_slope', 1.0),1.0)
@@ -2244,6 +2259,7 @@ def generate(genparams, stream_flag=False):
     inputs.sigmoid_height = sigmoid_height
     inputs.sigmoid_strength = sigmoid_strength
     inputs.nsigma = nsigma
+    inputs.raw_logprobs = raw_logprobs
     inputs.rep_pen = rep_pen
     inputs.rep_pen_range = rep_pen_range
     inputs.rep_pen_slope = rep_pen_slope
@@ -4034,6 +4050,18 @@ def parse_last_logprobs(lastlogprobs):
             lp_content_item['top_logprobs'].append(tl_item)
         logprobsdict['top_logprobs'].append(tops)
         logprobsdict['content'].append(lp_content_item)
+    # opt-in raw pre-sampler distribution (request field raw_logprobs=N); absent otherwise
+    rawlp = handle.last_raw_logprobs()
+    if rawlp and rawlp.count == lastlogprobs.count:
+        for i in range(rawlp.count):
+            ritem = rawlp.items[i]
+            if ritem.count <= 0:
+                continue
+            logprobsdict['content'][i]['raw_top_logprobs'] = [
+                {"token_id": ritem.token_ids[j],
+                 "token": ctypes.string_at(ritem.tokens[j]).decode("UTF-8","ignore"),
+                 "logprob": ritem.logprobs[j],
+                 "prob": ritem.probs[j]} for j in range(ritem.count)]
     return logprobsdict
 
 def extract_tool_info_from_tool_array(chosen_tool, tools_array):
