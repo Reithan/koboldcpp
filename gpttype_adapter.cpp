@@ -168,6 +168,7 @@ static std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>> dry_se
 static std::vector<int> dry_repeat_count; // Indexed as last_n_tokens
 static std::unordered_map<gpt_vocab::id, int> dry_max_token_repeat;
 static std::vector<TopPicksData> top_picks_history;
+static int raw_logprobs_n = 0; //requested raw top-N per token (0 = off)
 static int remaining_tokens = 0;
 static bool early_abort = false;
 static std::mutex concat_output_mtx;
@@ -1254,6 +1255,44 @@ void sample_softmax(llama_token_data_array * cur_p) {
     sample_softmax(cur_p, true, nullptr);
 }
 
+// Raw pre-sampler capture: max-subtracted softmax over the full vocab, double-accumulated sum,
+// no probability clamp. Held until sample_token attaches it to the matching TopPicksData entry.
+struct RawProbCapture
+{
+    bool valid = false;
+    std::vector<int> ids;
+    std::vector<float> logprobs;
+    std::vector<float> p;
+};
+static RawProbCapture pending_raw_capture;
+
+static void capture_raw_probs(const float * logits, int n_vocab, int topn)
+{
+    pending_raw_capture.valid = false;
+    topn = std::min(std::min(topn, raw_logprobs_max), n_vocab);
+    if (topn <= 0 || n_vocab <= 0) { return; }
+    float maxl = -INFINITY;
+    for (int i = 0; i < n_vocab; ++i) { maxl = std::max(maxl, logits[i]); }
+    if (!std::isfinite(maxl)) { return; }
+    double sum = 0.0;
+    for (int i = 0; i < n_vocab; ++i) { sum += std::exp((double)logits[i] - (double)maxl); }
+    const double lse = (double)maxl + std::log(sum);
+    std::vector<int> idx(n_vocab);
+    for (int i = 0; i < n_vocab; ++i) { idx[i] = i; }
+    std::partial_sort(idx.begin(), idx.begin() + topn, idx.end(),
+        [&](int a, int b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); });
+    pending_raw_capture.ids.assign(idx.begin(), idx.begin() + topn);
+    pending_raw_capture.logprobs.resize(topn);
+    pending_raw_capture.p.resize(topn);
+    for (int i = 0; i < topn; ++i)
+    {
+        const double lp = (double)logits[idx[i]] - lse;
+        pending_raw_capture.logprobs[i] = (float)lp;
+        pending_raw_capture.p[i] = (float)std::exp(lp);
+    }
+    pending_raw_capture.valid = true;
+}
+
 llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng, bool* probabilities_normalized = nullptr)
 {
     sample_softmax(candidates, probabilities_normalized);
@@ -1294,6 +1333,19 @@ llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng
         newpick.logprobs.push_back(logProb(candidates->data[i].p));
         newpick.p.push_back(candidates->data[i].p);
         newpick.tokenid.push_back(candidates->data[i].id);
+    }
+
+    if (pending_raw_capture.valid)
+    {
+        newpick.raw_tokenid = std::move(pending_raw_capture.ids);
+        newpick.raw_logprobs = std::move(pending_raw_capture.logprobs);
+        newpick.raw_p = std::move(pending_raw_capture.p);
+        newpick.raw_tokens.reserve(newpick.raw_tokenid.size());
+        for (int rid : newpick.raw_tokenid)
+        {
+            newpick.raw_tokens.push_back(FileFormatTokenizeID(rid, file_format, true));
+        }
+        pending_raw_capture.valid = false;
     }
 
     top_picks_history.push_back(newpick);
@@ -2440,6 +2492,7 @@ int SampleLogits(
     candidates.resize(n_vocab);
     int id = 0;
     bool probabilities_normalized = false;
+    if (raw_logprobs_n > 0) { capture_raw_probs(logits, n_vocab, raw_logprobs_n); } //before biases/penalties/samplers
     for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
         candidates[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
     }
@@ -5912,6 +5965,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     kcpp_data->typical_p = inputs.typical_p;
     kcpp_data->tfs_z = inputs.tfs;
     kcpp_data->nsigma = inputs.nsigma;
+    raw_logprobs_n = std::max(0, std::min(inputs.raw_logprobs, raw_logprobs_max));
+    pending_raw_capture.valid = false;
     kcpp_data->temp = inputs.temperature;
     kcpp_data->repeat_last_n = inputs.rep_pen_range;
     kcpp_data->rep_pen_slope = inputs.rep_pen_slope;

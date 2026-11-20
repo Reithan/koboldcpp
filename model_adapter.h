@@ -71,6 +71,11 @@ struct TopPicksData
     std::vector<int> tokenid;
     std::vector<float> logprobs;
     std::vector<float> p;
+    // opt-in raw (pre-sampler, unclamped, full-vocab softmax) top-N; empty unless requested
+    std::vector<int> raw_tokenid;
+    std::vector<std::string> raw_tokens;
+    std::vector<float> raw_logprobs;
+    std::vector<float> raw_p;
 };
 
 enum ModelLoadResult
